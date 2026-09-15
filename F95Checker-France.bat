@@ -234,6 +234,11 @@ def auto_update_upstream() -> None:
 
     broken = BROKEN_MARKER.read_text(encoding="utf-8").strip() if BROKEN_MARKER.is_file() else ""
     if remote == broken:
+        print(
+            f"Une mise a jour de F95Checker est disponible ({local[:7]} -> {remote[:7]}) "
+            "mais reste incompatible avec nos patches. Le lancement se poursuit avec la "
+            "version actuellement installee."
+        )
         return  # Deja tente et incompatible, on ne reessaie pas a chaque lancement
 
     print(f"Mise a jour F95Checker disponible ({local[:7]} -> {remote[:7]})...")
