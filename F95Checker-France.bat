@@ -124,6 +124,7 @@ PATCHED_FILES_TO_VERIFY = (
     "modules/globals.py",
     "modules/rpc_thread.py",
     "common/structs.py",
+    "common/meta.py",
     "modules/wine.py",
 )
 
@@ -769,6 +770,29 @@ WINE_BUILD_WRAPPER_NEW = """    elif runner.name in ("proton", "proton-ge"):
         return "%command%\""""
 
 
+META_VERSION_OLD = '''build_number = 0
+version_name = f"{version}{'' if release else ' beta'}{'' if release or not build_number else ' ' + str(build_number)}"'''
+
+META_VERSION_NEW = '''build_number = 0
+
+
+def _france_git_commit() -> str:
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=pathlib.Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+build_commit = "" if release or build_number else _france_git_commit()
+version_name = f"{version}{'' if release else ' beta'}{'' if release or not build_number else ' ' + str(build_number)}{'' if release or build_number or not build_commit else ' (' + build_commit + ')'}"'''
+
+
 def _patch_text(path: Path, old: str, new: str, marker: str, label: str) -> bool:
     text = path.read_text(encoding="utf-8")
     if marker in text:
@@ -927,6 +951,16 @@ def apply_patches() -> None:
         import py_compile
         py_compile.compile(str(wine_module), doraise=True)
         print("Support umu-launcher ajoute (wine.py).")
+    meta_module = SRC / "common" / "meta.py"
+    meta_text = meta_module.read_text(encoding="utf-8")
+    if "_france_git_commit" not in meta_text:
+        if META_VERSION_OLD not in meta_text:
+            print("ATTENTION : meta.py a change, affichage du commit impossible.")
+        else:
+            meta_module.write_text(meta_text.replace(META_VERSION_OLD, META_VERSION_NEW, 1), encoding="utf-8")
+            import py_compile
+            py_compile.compile(str(meta_module), doraise=True)
+            print("Commit F95Checker-src affiche a la place du numero de build (meta.py).")
     apply_lc_patches()
 
 
