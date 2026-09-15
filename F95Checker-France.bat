@@ -407,13 +407,13 @@ chrome.contextMenus.create({
     targetUrlPatterns: ['*://*.f95zone.to/threads/*', '*://*.lewdcorner.com/threads/*'],
 });"""
 
-GUI_ADD_BOX_OLD = "                async_thread.run(callbacks.add_games(*utils.extract_thread_matches(self.add_box_text)))"
+GUI_ADD_BOX_OLD = "                async_thread.run(callbacks.add_games(*utils.extract_thread_matches(self.add_box_text), open_duplicate=True))"
 
 GUI_ADD_BOX_NEW = """                from modules import lc_games
                 lc_urls, other_text = lc_games.split_add_box_text(self.add_box_text)
                 matches = utils.extract_thread_matches(other_text)
                 if matches:
-                    async_thread.run(callbacks.add_games(*matches))
+                    async_thread.run(callbacks.add_games(*matches, open_duplicate=True))
                 if lc_urls:
                     async_thread.run(lc_games.add_lc_games(lc_urls))"""
 
