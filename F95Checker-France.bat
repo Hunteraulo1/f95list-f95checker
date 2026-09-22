@@ -1539,6 +1539,11 @@ _LC_BROWSER_HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
 }
 
 
@@ -1558,6 +1563,12 @@ async def _fetch_page(url: str) -> tuple[bytes | None, str | None]:
     try:
         async with api.request("GET", url, cookies=cookies, timeout=30, headers=_LC_BROWSER_HEADERS) as (res, req):
             if req.status >= 400:
+                if req.status == 403 and b"required reading" in res.lower():
+                    # LewdCorner bloque tout le site (meme la home) tant qu'un sujet marque
+                    # "lecture obligatoire" par le staff n'a pas ete ouvert une fois par ce
+                    # compte, dans un vrai navigateur. Le compte est bien connecte : ca n'a
+                    # rien a voir avec Cloudflare ni avec des cookies perimes.
+                    return None, "REQUIRED_READING"
                 return None, f"HTTP {req.status}"
             return res, None
     except Exception as exc:
@@ -1835,6 +1846,15 @@ async def _scrape_and_apply(game) -> tuple[bool, str]:
     return True, ""
 
 
+async def check_lc_session() -> tuple[bool, str | None]:
+    """Verifie qu'une requete simple vers LewdCorner passe, avant de lancer un refresh
+    par jeu. Une session/cookie 'cf_clearance' perime bloque TOUTES les requetes de la
+    meme facon (pas juste certains jeux), donc un seul aller-retour ici evite d'envoyer
+    N requetes vouees a echouer identiquement en 403. Renvoie (ok, erreur)."""
+    html, err = await _fetch_page(f"https://{LC_HOST_MARKER}/")
+    return html is not None, err
+
+
 async def refresh_lc_game(game) -> None:
     """Point d'entree appele depuis api.refresh() pour les jeux custom LewdCorner."""
     from common.structs import MsgBox
@@ -1843,11 +1863,19 @@ async def refresh_lc_game(game) -> None:
     try:
         success, error_msg = await _scrape_and_apply(game)
         if not success:
-            utils.push_popup(
-                msgbox.msgbox, "LewdCorner",
-                f'Echec de la verification pour "{game.name}" :\n{error_msg}',
-                MsgBox.warn,
-            )
+            if "HTTP 403" in error_msg or error_msg == "REQUIRED_READING":
+                # Le 403 sur LewdCorner vient quasi toujours d'une session/cookie
+                # Cloudflare (cf_clearance) perimee ou liee a une autre IP que celle
+                # de ce client HTTP, pas d'un vrai probleme par jeu. Regrouper ces
+                # echecs en un seul message (voir api.refresh) au lieu de spammer
+                # une popup par jeu.
+                globals.lc_session_expired_games.append(game.name)
+            else:
+                utils.push_popup(
+                    msgbox.msgbox, "LewdCorner",
+                    f'Echec de la verification pour "{game.name}" :\n{error_msg}',
+                    MsgBox.warn,
+                )
     except Exception:
         from external import error
         utils.push_popup(
