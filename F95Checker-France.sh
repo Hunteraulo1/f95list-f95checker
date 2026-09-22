@@ -12,9 +12,56 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BAT_FILE="$SCRIPT_DIR/F95Checker-France.bat"
+SH_FILE="$SCRIPT_DIR/F95Checker-France.sh"
 RUNTIME="$SCRIPT_DIR/._f95_france_cache"
 SRCDIR="$SCRIPT_DIR/F95Checker-src"
 REPO="https://github.com/WillyJL/F95Checker.git"
+
+# Mise a jour auto du launcher (.bat + .sh) depuis GitHub (laisser vide pour desactiver) :
+UPDATE_REPO_RAW="https://raw.githubusercontent.com/Hunteraulo1/f95list-f95checker/main"
+
+NO_UPDATE=0
+if [[ "${1:-}" == "--no-update" ]]; then
+    NO_UPDATE=1
+    shift
+fi
+
+# On met a jour les DEUX scripts (.sh et .bat), meme si un seul des deux est
+# lance ici : la plupart des autres utilisateurs ne lancent que le .bat, donc
+# c'est le seul moyen pour eux de recevoir les correctifs sans repasser par git.
+if [[ "$NO_UPDATE" == "0" && -n "$UPDATE_REPO_RAW" ]] && command -v curl >/dev/null 2>&1; then
+    sh_updated=0
+
+    tmp_sh="$(mktemp)"
+    if curl -fsSL --max-time 20 "$UPDATE_REPO_RAW/F95Checker-France.sh" -o "$tmp_sh" 2>/dev/null && [[ -s "$tmp_sh" ]]; then
+        if ! cmp -s "$tmp_sh" "$SH_FILE" 2>/dev/null; then
+            chmod +x "$tmp_sh"
+            mv "$tmp_sh" "$SH_FILE"
+            sh_updated=1
+        else
+            rm -f "$tmp_sh"
+        fi
+    else
+        rm -f "$tmp_sh"
+    fi
+
+    tmp_bat="$(mktemp)"
+    if curl -fsSL --max-time 20 "$UPDATE_REPO_RAW/F95Checker-France.bat" -o "$tmp_bat" 2>/dev/null && [[ -s "$tmp_bat" ]]; then
+        if ! cmp -s "$tmp_bat" "$BAT_FILE" 2>/dev/null; then
+            mv "$tmp_bat" "$BAT_FILE"
+            echo "F95Checker-France.bat mis a jour (pour tes utilisateurs Windows)."
+        else
+            rm -f "$tmp_bat"
+        fi
+    else
+        rm -f "$tmp_bat"
+    fi
+
+    if [[ "$sh_updated" == "1" ]]; then
+        echo "Mise a jour du launcher disponible, redemarrage..."
+        exec "$SH_FILE" --no-update "$@"
+    fi
+fi
 
 EXTRA=""
 DO_LAUNCH=1

@@ -2,12 +2,14 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-REM Mise a jour auto depuis Gist (laisser vide pour desactiver) :
-REM set "GIST_RAW_URL=https://gist.githubusercontent.com/Hunteraulo1/a80374e7e352735b91b1709fc17d57f0/raw/84ca3878db75d666483a421b4411095bf2a8ce3e/gistfile1.bat"
-set "GIST_RAW_URL="
+REM Mise a jour auto du launcher (.bat + .sh) depuis GitHub (laisser vide pour desactiver) :
+set "UPDATE_REPO_RAW=https://raw.githubusercontent.com/Hunteraulo1/f95list-f95checker/main"
 
-if /i "%~1"=="--no-update" shift
-if defined GIST_RAW_URL call :gist_update
+if /i "%~1"=="--no-update" (
+    shift
+    set "UPDATE_REPO_RAW="
+)
+if defined UPDATE_REPO_RAW call :self_update
 if errorlevel 1 exit /b 0
 
 set "RUNTIME=%~dp0._f95_france_cache"
@@ -73,26 +75,32 @@ exit /b 0
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $bat='%~f0'; $rt='%RUNTIME%'; [IO.Directory]::CreateDirectory($rt)|Out-Null; $lines=[IO.File]::ReadAllLines($bat,[Text.Encoding]::UTF8); $blocks=@(@('@@BEGIN_SETUP_FRANCE@@','setup_france.py'),@('@@BEGIN_FRANCE_LABELS@@','france_labels.py'),@('@@BEGIN_FRANCE_ICON@@','france_icon.py'),@('@@BEGIN_LC_GAMES@@','lc_games.py'),@('@@BEGIN_SILENT_LAUNCHER@@','silent_launch.vbs')); foreach($pair in $blocks){ $b=@(); $in=$false; foreach($l in $lines){ if($l -eq $pair[0]){$in=$true; continue}; $end=$pair[0] -replace 'BEGIN','END'; if($l -eq $end){break}; if($in){$b+=$l}}; if(-not $b.Count){ throw ('Bloc '+$pair[0]+' introuvable') }; [IO.File]::WriteAllLines((Join-Path $rt $pair[1]),$b,[Text.UTF8Encoding]::new($false)) } }"
 exit /b %ERRORLEVEL%
 
-:gist_update
+:self_update
+REM Met a jour les DEUX scripts (.bat et .sh), meme lance depuis le .bat :
+REM la plupart des autres utilisateurs ne lancent que le .bat, donc c'est le
+REM seul moyen pour eux de recevoir aussi les correctifs du .sh sans passer par git.
 if not exist "%~dp0._f95_france_cache" mkdir "%~dp0._f95_france_cache"
-set "GIST_TMP=%~dp0._f95_france_cache\F95Checker-France.gist.bat"
-set "GIST_HELPER=%~dp0._f95_france_cache\apply_gist_update.cmd"
+set "UPDATE_TMP=%~dp0._f95_france_cache\F95Checker-France.update.bat"
+set "UPDATE_HELPER=%~dp0._f95_france_cache\apply_self_update.cmd"
+set "SH_TARGET=%~dp0F95Checker-France.sh"
+set "SELF_BAT=%~f0"
 set "F95_RELUNCH_ARGS=%*"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri $env:GIST_RAW_URL -OutFile $env:GIST_TMP -UseBasicParsing -TimeoutSec 30; exit 0 } catch { exit 2 }"
-if errorlevel 1 exit /b 0
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$a=(Get-FileHash -Algorithm SHA256 $env:GIST_TMP).Hash; $b=(Get-FileHash -Algorithm SHA256 '%~f0').Hash; if($a -eq $b){exit 1}else{exit 0}"
-if errorlevel 1 exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference='Stop'; $base=$env:UPDATE_REPO_RAW; $batChanged=$false; try { Invoke-WebRequest -Uri ($base+'/F95Checker-France.bat') -OutFile $env:UPDATE_TMP -UseBasicParsing -TimeoutSec 30; $a=(Get-FileHash -Algorithm SHA256 $env:UPDATE_TMP).Hash; $b=(Get-FileHash -Algorithm SHA256 $env:SELF_BAT).Hash; if($a -ne $b){ $batChanged=$true } else { Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue } } catch { $batChanged=$false }; try { $tmpSh=[IO.Path]::GetTempFileName(); Invoke-WebRequest -Uri ($base+'/F95Checker-France.sh') -OutFile $tmpSh -UseBasicParsing -TimeoutSec 30; $needSh=$true; if(Test-Path $env:SH_TARGET){ $c=(Get-FileHash -Algorithm SHA256 $tmpSh).Hash; $d=(Get-FileHash -Algorithm SHA256 $env:SH_TARGET).Hash; $needSh=($c -ne $d) }; if($needSh){ Copy-Item $tmpSh $env:SH_TARGET -Force; Write-Host 'F95Checker-France.sh mis a jour (pour tes utilisateurs Linux).' }; Remove-Item $tmpSh -ErrorAction SilentlyContinue } catch {}; if($batChanged){ exit 1 } else { exit 0 } }"
+if errorlevel 1 goto :self_update_apply_bat
+goto :eof
+
+:self_update_apply_bat
 echo.
-echo Mise a jour depuis Gist...
+echo Mise a jour du launcher disponible, installation...
 (
 echo @echo off
 echo ping -n 2 127.0.0.1 ^>nul
-echo copy /y "%GIST_TMP%" "%~f0" ^>nul
-echo del "%GIST_TMP%" 2^>nul
-echo start "" "%~f0" %F95_RELUNCH_ARGS%
+echo copy /y "%UPDATE_TMP%" "%SELF_BAT%" ^>nul
+echo del "%UPDATE_TMP%" 2^>nul
+echo start "" "%SELF_BAT%" %F95_RELUNCH_ARGS%
 echo del "%%~f0"
-) > "%GIST_HELPER%"
-start "" /min cmd /c "%GIST_HELPER%"
+) > "%UPDATE_HELPER%"
+start "" /min cmd /c "%UPDATE_HELPER%"
 exit /b 1
 
 goto :eof
