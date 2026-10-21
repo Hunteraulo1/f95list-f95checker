@@ -212,6 +212,18 @@ def _verify_patched_files_compile() -> None:
         py_compile.compile(str(SRC / rel), doraise=True)
 
 
+def _broken_marker_value(commit: str) -> str:
+    """Commit casse + empreinte de nos scripts de patch : un launcher corrige
+    invalide le marqueur et retente la mise a jour, meme sans nouveau commit amont."""
+    import hashlib
+    digest = hashlib.sha256()
+    for name in ("setup_france.py", "lc_games.py", "france_labels.py", "france_icon.py"):
+        path = PATCH_DIR / name
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return f"{commit} {digest.hexdigest()[:12]}"
+
+
 def auto_update_upstream() -> None:
     """Recupere les nouveaux commits de F95Checker et reapplique nos patches.
 
@@ -242,7 +254,7 @@ def auto_update_upstream() -> None:
         return  # Deja a jour
 
     broken = BROKEN_MARKER.read_text(encoding="utf-8").strip() if BROKEN_MARKER.is_file() else ""
-    if remote == broken:
+    if broken == _broken_marker_value(remote):
         print(
             f"Une mise a jour de F95Checker est disponible ({local[:7]} -> {remote[:7]}) "
             "mais reste incompatible avec nos patches. Le lancement se poursuit avec la "
@@ -262,7 +274,7 @@ def auto_update_upstream() -> None:
         subprocess.run(["git", "reset", "--hard", local], check=True, cwd=SRC, capture_output=True)
         (SRC / ".deps_ok").unlink(missing_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        BROKEN_MARKER.write_text(remote, encoding="utf-8")
+        BROKEN_MARKER.write_text(_broken_marker_value(remote), encoding="utf-8")
         return  # main() rappelle apply_patches() juste apres, sur la version restauree
 
     if BROKEN_MARKER.is_file():
@@ -623,53 +635,13 @@ CALLBACKS_STARTDIR_NEW = """    start_dir = globals.settings.default_exe_dir.get
         start_dir = _find_game_dir(pathlib.Path(start_dir), game)"""
 
 
-API_REFRESH_OLD = """async def refresh(*games: list[Game], full=False, notifs=True, force_archived=False, force_completed=False):
-    fast_queue: list[list[Game]] = [[]]
+API_LC_QUEUE_OLD = """    fast_queue: list[list[Game]] = [[]]
     for game in (games or globals.games.values()):
         if game.custom:
             continue
-        if not games:
-            if game.archived and not globals.settings.refresh_archived_games and not force_archived:
-                continue
-            if not game.image.missing:
-                if game.status is Status.Completed and not globals.settings.refresh_completed_games and not force_completed:
-                    continue
-        if len(fast_queue[-1]) == api_fast_check_max_ids:
-            fast_queue.append([])
-        fast_queue[-1].append(game)
+"""
 
-    notifs = notifs and globals.settings.check_notifs
-    globals.refresh_progress += 1
-    globals.refresh_total += sum(len(chunk) for chunk in fast_queue) + bool(notifs)
-
-    global fast_checks_sem, full_checks_sem, fast_checks_counter
-    fast_checks_sem = asyncio.Semaphore(1)
-    full_checks_sem = asyncio.Semaphore(globals.settings.max_connections)
-    fast_checks_counter = 0
-    tasks: list[asyncio.Task] = []
-    try:
-        tasks = [asyncio.create_task(fast_check(chunk, full=full)) for chunk in fast_queue]
-        await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        fast_checks_sem = None
-        full_checks_sem = None
-        fast_checks_counter = 0
-        raise
-    fast_checks_sem = None
-    full_checks_sem = None
-    fast_checks_counter = 0
-
-    if notifs:
-        await check_notifs(standalone=False)
-
-    if not games:
-        globals.settings.last_successful_refresh.update(time.time())
-        await db.update_settings("last_successful_refresh")"""
-
-API_REFRESH_NEW = """async def refresh(*games: list[Game], full=False, notifs=True, force_archived=False, force_completed=False):
-    from modules import lc_games
+API_LC_QUEUE_NEW = """    from modules import lc_games
     fast_queue: list[list[Game]] = [[]]
     lc_queue: list[Game] = []
     for game in (games or globals.games.values()):
@@ -683,46 +655,32 @@ API_REFRESH_NEW = """async def refresh(*games: list[Game], full=False, notifs=Tr
                             continue
                 lc_queue.append(game)
             continue
-        if not games:
-            if game.archived and not globals.settings.refresh_archived_games and not force_archived:
-                continue
-            if not game.image.missing:
-                if game.status is Status.Completed and not globals.settings.refresh_completed_games and not force_completed:
-                    continue
-        if len(fast_queue[-1]) == api_fast_check_max_ids:
-            fast_queue.append([])
-        fast_queue[-1].append(game)
+"""
 
-    notifs = notifs and globals.settings.check_notifs
-    globals.refresh_progress += 1
-    globals.refresh_total += sum(len(chunk) for chunk in fast_queue) + bool(notifs) + len(lc_queue)
+API_LC_TOTAL_OLD = """    globals.refresh_total += sum(len(chunk) for chunk in fast_queue) + bool(notifs)
+"""
 
-    global fast_checks_sem, full_checks_sem, fast_checks_counter
-    fast_checks_sem = asyncio.Semaphore(1)
-    full_checks_sem = asyncio.Semaphore(globals.settings.max_connections)
-    fast_checks_counter = 0
-    tasks: list[asyncio.Task] = []
-    try:
-        tasks = [asyncio.create_task(fast_check(chunk, full=full)) for chunk in fast_queue]
-        tasks += [asyncio.create_task(lc_games.refresh_lc_game(game)) for game in lc_queue]
+API_LC_TOTAL_NEW = """    globals.refresh_total += sum(len(chunk) for chunk in fast_queue) + bool(notifs) + len(lc_queue)
+"""
+
+API_LC_TASKS_OLD = """        await asyncio.gather(*tasks)
+"""
+
+# @UPDATES@ : dict local "updates" des versions upstream recentes, sinon None
+# (lc_games retombe alors sur l'ancien globals.new_updated_games)
+API_LC_TASKS_NEW = """        tasks += await lc_games.start_refresh(lc_queue, @UPDATES@)
         await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        fast_checks_sem = None
-        full_checks_sem = None
-        fast_checks_counter = 0
-        raise
-    fast_checks_sem = None
-    full_checks_sem = None
-    fast_checks_counter = 0
+"""
+
+API_LC_REPORT_OLD = """    if notifs:
+        await check_notifs(standalone=False)
+"""
+
+API_LC_REPORT_NEW = """    lc_games.report_session_expired()
 
     if notifs:
         await check_notifs(standalone=False)
-
-    if not games:
-        globals.settings.last_successful_refresh.update(time.time())
-        await db.update_settings("last_successful_refresh")"""
+"""
 
 
 WINE_DISCOVER_OLD = """def discover():
@@ -824,6 +782,29 @@ def _rezip(folder: Path, zip_path: Path) -> None:
                 zf.write(file, file.relative_to(folder))
 
 
+def _patch_api_refresh(text: str) -> str:
+    """Branche LewdCorner dans api.refresh() via de petites ancres, limitees au corps
+    de la fonction, plutot que de remplacer la fonction entiere : survit aux
+    changements upstream qui ne touchent pas ces lignes precises."""
+    start = text.find("\nasync def refresh(")
+    if start == -1:
+        raise SystemExit("api.py a change : fonction refresh() introuvable.")
+    ends = [i for i in (text.find("\nasync def ", start + 1), text.find("\ndef ", start + 1)) if i != -1]
+    end = min(ends) if ends else len(text)
+    func = text[start:end]
+    updates_arg = "updates" if "    updates: dict[int, OldGame] = {}\n" in func else "None"
+    for old, new, label in (
+        (API_LC_QUEUE_OLD, API_LC_QUEUE_NEW, "file d'attente"),
+        (API_LC_TOTAL_OLD, API_LC_TOTAL_NEW, "progression"),
+        (API_LC_TASKS_OLD, API_LC_TASKS_NEW.replace("@UPDATES@", updates_arg), "taches"),
+        (API_LC_REPORT_OLD, API_LC_REPORT_NEW, "rapport session"),
+    ):
+        if func.count(old) != 1:
+            raise SystemExit(f"api.py a change : patch refresh() LewdCorner impossible ({label}).")
+        func = func.replace(old, new, 1)
+    return text[:start] + func + text[end:]
+
+
 def apply_lc_patches() -> None:
     lc_module = SRC / "modules" / "lc_games.py"
     shutil.copy2(PATCH_DIR / "lc_games.py", lc_module)
@@ -868,9 +849,7 @@ def apply_lc_patches() -> None:
     api_module = SRC / "modules" / "api.py"
     api_text = api_module.read_text(encoding="utf-8")
     if "lc_games" not in api_text:
-        if API_REFRESH_OLD not in api_text:
-            raise SystemExit("api.py a change : patch refresh() LewdCorner impossible.")
-        api_module.write_text(api_text.replace(API_REFRESH_OLD, API_REFRESH_NEW, 1), encoding="utf-8")
+        api_module.write_text(_patch_api_refresh(api_text), encoding="utf-8")
         import py_compile
         py_compile.compile(str(api_module), doraise=True)
         print("Suivi des mises a jour LewdCorner branche sur refresh() (api.py).")
@@ -1450,6 +1429,9 @@ from pathlib import Path
 
 LC_HOST_MARKER = "lewdcorner.com"
 _THREAD_RE = re.compile(r"threads/(?:([^./]*)\.)?(\d+)")
+# Jeux dont la verification a echoue en 403 pendant le refresh en cours, signales
+# en une seule popup par report_session_expired() a la fin de api.refresh()
+_session_expired_games: list[str] = []
 _LC_URL_RE = re.compile(r"\S*lewdcorner\.com/threads/(?:[^./\s]*\.)?\d+\S*", re.IGNORECASE)
 
 
@@ -1770,7 +1752,7 @@ async def _parse_page(html: bytes, url: str = ""):
     return parsed, None
 
 
-async def _scrape_and_apply(game) -> tuple[bool, str]:
+async def _scrape_and_apply(game, updates: dict | None = None) -> tuple[bool, str]:
     """Recupere + parse la page du thread LC et met a jour le jeu. Renvoie (succes, erreur)."""
     from common.structs import OldGame, Status, TimelineEventType
     from modules import globals
@@ -1844,12 +1826,17 @@ async def _scrape_and_apply(game) -> tuple[bool, str]:
             game.add_timeline_event(TimelineEventType.ChangedVersion, old_version, game.version)
 
     if not game.archived and old_status is not Status.Unchecked and (changed_name or changed_status or changed_version):
-        globals.new_updated_games[game.id] = OldGame(
-            id=game.id,
-            name=old_name,
-            version=old_version,
-            status=old_status,
-        )
+        # Upstream recent : dict "updates" local a api.refresh() ; ancien upstream :
+        # globals.new_updated_games
+        if updates is None:
+            updates = getattr(globals, "new_updated_games", None)
+        if updates is not None:
+            updates[game.id] = OldGame(
+                id=game.id,
+                name=old_name,
+                version=old_version,
+                status=old_status,
+            )
 
     return True, ""
 
@@ -1863,13 +1850,13 @@ async def check_lc_session() -> tuple[bool, str | None]:
     return html is not None, err
 
 
-async def refresh_lc_game(game) -> None:
-    """Point d'entree appele depuis api.refresh() pour les jeux custom LewdCorner."""
+async def refresh_lc_game(game, updates: dict | None = None) -> None:
+    """Refresh d'un jeu custom LewdCorner, lance par start_refresh()."""
     from common.structs import MsgBox
     from modules import globals, msgbox, utils
 
     try:
-        success, error_msg = await _scrape_and_apply(game)
+        success, error_msg = await _scrape_and_apply(game, updates)
         if not success:
             if "HTTP 403" in error_msg or error_msg == "REQUIRED_READING":
                 # Le 403 sur LewdCorner vient quasi toujours d'une session/cookie
@@ -1877,7 +1864,7 @@ async def refresh_lc_game(game) -> None:
                 # de ce client HTTP, pas d'un vrai probleme par jeu. Regrouper ces
                 # echecs en un seul message (voir api.refresh) au lieu de spammer
                 # une popup par jeu.
-                globals.lc_session_expired_games.append(game.name)
+                _session_expired_games.append(game.name)
             else:
                 utils.push_popup(
                     msgbox.msgbox, "LewdCorner",
@@ -1894,6 +1881,40 @@ async def refresh_lc_game(game) -> None:
         )
     finally:
         globals.refresh_progress += 1
+
+
+async def start_refresh(games: list, updates: dict | None = None) -> list:
+    """Point d'entree appele depuis api.refresh() : verifie d'abord la session LC une
+    seule fois, et ne lance les refresh par jeu (taches renvoyees) que si elle passe."""
+    import asyncio
+    from modules import globals
+
+    if not games:
+        return []
+    ok, err = await check_lc_session()
+    if not ok and err and ("HTTP 403" in err or err == "REQUIRED_READING"):
+        _session_expired_games.extend(game.name for game in games)
+        globals.refresh_progress += len(games)
+        return []
+    return [asyncio.create_task(refresh_lc_game(game, updates)) for game in games]
+
+
+def report_session_expired() -> None:
+    """Affiche une seule popup pour tous les jeux LC refuses en 403 pendant ce refresh."""
+    from common.structs import MsgBox
+    from modules import msgbox, utils
+
+    if not _session_expired_games:
+        return
+    names = sorted(set(_session_expired_games))
+    _session_expired_games.clear()
+    utils.push_popup(
+        msgbox.msgbox, "LewdCorner",
+        f"{len(names)} jeu(x) LewdCorner non verifie(s) : session expiree ou refusee (HTTP 403).\n"
+        "Reconnectez-vous via le bouton Se connecter dans la sidebar LewdCorner.",
+        MsgBox.warn,
+        more="\n".join(names),
+    )
 
 
 async def add_lc_game(url: str) -> tuple[str, bool]:
