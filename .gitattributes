@@ -1,0 +1,5 @@
+# Les .bat doivent rester en CRLF dans le depot : la mise a jour auto
+# telecharge le fichier brut depuis GitHub, et cmd.exe lit mal les etiquettes
+# (:label) d'un gros .bat en LF.
+*.bat -text
+*.sh text eol=lf

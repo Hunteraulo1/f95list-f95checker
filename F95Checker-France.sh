@@ -112,7 +112,9 @@ extract_block() {
     local begin_marker="$1"
     local end_marker="$2"
     local out_file="$3"
+    # Le .bat est en CRLF (requis par cmd.exe) : on retire le \r avant de comparer
     awk -v begin="$begin_marker" -v end="$end_marker" '
+        { sub(/\r$/, "") }
         $0 == begin { grabbing=1; next }
         $0 == end   { grabbing=0 }
         grabbing   { print }
