@@ -1637,18 +1637,26 @@ def _detect_lc_type_status(head):
     return type_, status
 
 
+_LC_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
 def _parse_lc_date(text: str) -> int:
     import datetime as dt
     from common.parser import datestamp
 
-    text = (text or "").strip()
-    if not text:
+    # Pas de strptime("%b") : Qt applique la locale systeme (ex: fr_FR) au demarrage,
+    # et "Sep" n'est alors plus reconnu, ce qui mettait toutes les dates a 0
+    match = re.match(r"^([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{1,2}),?\s+(\d{4})$", (text or "").strip())
+    if not match:
+        return 0
+    month = _LC_MONTHS.get(match.group(1).lower())
+    if not month:
         return 0
     try:
-        parsed = dt.datetime.strptime(text, "%b %d, %Y")
+        parsed = dt.datetime(int(match.group(3)), month, int(match.group(2)), tzinfo=dt.timezone.utc)
     except ValueError:
         return 0
-    return datestamp(parsed.replace(tzinfo=dt.timezone.utc).timestamp())
+    return datestamp(parsed.timestamp())
 
 
 async def _parse_page(html: bytes, url: str = ""):
