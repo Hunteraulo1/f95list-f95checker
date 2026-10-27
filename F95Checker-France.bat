@@ -1432,6 +1432,8 @@ _THREAD_RE = re.compile(r"threads/(?:([^./]*)\.)?(\d+)")
 # Jeux dont la verification a echoue en 403 pendant le refresh en cours, signales
 # en une seule popup par report_session_expired() a la fin de api.refresh()
 _session_expired_games: list[str] = []
+# Autres echecs (502, timeout...) regroupes par message d'erreur, meme principe
+_failed_games: dict[str, list[str]] = {}
 _LC_URL_RE = re.compile(r"\S*lewdcorner\.com/threads/(?:[^./\s]*\.)?\d+\S*", re.IGNORECASE)
 
 
@@ -1866,11 +1868,7 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
                 # une popup par jeu.
                 _session_expired_games.append(game.name)
             else:
-                utils.push_popup(
-                    msgbox.msgbox, "LewdCorner",
-                    f'Echec de la verification pour "{game.name}" :\n{error_msg}',
-                    MsgBox.warn,
-                )
+                _failed_games.setdefault(error_msg, []).append(game.name)
     except Exception:
         from external import error
         utils.push_popup(
@@ -1896,13 +1894,29 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
         _session_expired_games.extend(game.name for game in games)
         globals.refresh_progress += len(games)
         return []
+    if not ok:
+        # Site injoignable (502, timeout, reseau...) : inutile de tenter chaque jeu
+        _failed_games.setdefault(f"LewdCorner injoignable ({err}).", []).extend(game.name for game in games)
+        globals.refresh_progress += len(games)
+        return []
     return [asyncio.create_task(refresh_lc_game(game, updates)) for game in games]
 
 
 def report_session_expired() -> None:
-    """Affiche une seule popup pour tous les jeux LC refuses en 403 pendant ce refresh."""
+    """Affiche une seule popup pour tous les jeux LC refuses en 403 pendant ce refresh,
+    et une par type d'erreur pour les autres echecs."""
     from common.structs import MsgBox
     from modules import msgbox, utils
+
+    for error_msg, failed in _failed_games.items():
+        names = sorted(set(failed))
+        utils.push_popup(
+            msgbox.msgbox, "LewdCorner",
+            f"{len(names)} jeu(x) LewdCorner non verifie(s) :\n{error_msg}",
+            MsgBox.warn,
+            more="\n".join(names),
+        )
+    _failed_games.clear()
 
     if not _session_expired_games:
         return
