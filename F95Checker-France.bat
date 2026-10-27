@@ -20,13 +20,12 @@ if /i "%~1"=="reconfigure" set "EXTRA=--reconfigure" & set "DO_LAUNCH=0"
 if /i "%~1"=="--reconfigure" set "EXTRA=--reconfigure" & set "DO_LAUNCH=0"
 if /i "%~1"=="setup-only" set "EXTRA=--setup-only" & set "DO_LAUNCH=0"
 
-set "PY=python"
-py -3.12 --version >nul 2>&1 && set "PY=py -3.12"
-if errorlevel 1 py -3 --version >nul 2>&1 && set "PY=py -3"
-
-%PY% --version >nul 2>&1
-if errorlevel 1 (
-    echo Python 3.11+ requis : https://www.python.org/downloads/
+REM Pas de "py -3" : il prend la version la plus recente (ex. 3.14), incompatible
+set "PY="
+for %%V in (3.12 3.11) do if not defined PY py -%%V --version >nul 2>&1 && set "PY=py -%%V"
+if not defined PY (
+    echo Python 3.12 requis. Installez-le avec : py install 3.12
+    echo ou via https://www.python.org/downloads/
     pause
     exit /b 1
 )
@@ -184,12 +183,9 @@ GUI_ANCHOR_REPLACEMENT = """            imgui.end_table()
 
 
 def find_python() -> list[str]:
-    for cmd in (["py", "-3.12"], ["py", "-3"], ["python"]):
-        try:
-            subprocess.run([*cmd, "--version"], check=True, capture_output=True)
-            return cmd
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            continue
+    # Le launcher (.bat/.sh) a deja choisi l'interpreteur qui execute ce script
+    if sys.version_info[:2] in ((3, 12), (3, 11)):
+        return [sys.executable]
     return []
 
 
@@ -1043,8 +1039,12 @@ def ensure_config(force: bool = False) -> None:
 
 
 def ensure_deps(py_cmd: list[str]) -> None:
+    # Le marqueur retient l'interpreteur : F95Checker-src peut etre partage entre
+    # Windows et Linux (dual boot), et un changement de version de Python impose
+    # de reinstaller les dependances.
     marker = SRC / ".deps_ok"
-    if marker.is_file():
+    stamp = f"{sys.executable} {sys.version}"
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == stamp:
         return
     print("Dependances (une fois, patientez)...")
     subprocess.run(
@@ -1052,7 +1052,7 @@ def ensure_deps(py_cmd: list[str]) -> None:
         check=True,
         cwd=SRC,
     )
-    marker.write_text("ok", encoding="utf-8")
+    marker.write_text(stamp, encoding="utf-8")
 
 
 def main() -> int:
@@ -1062,7 +1062,7 @@ def main() -> int:
     args = parser.parse_args()
     py_cmd = find_python()
     if not py_cmd:
-        print("Python 3.11+ introuvable.")
+        print("Python 3.12 (ou 3.11) requis.")
         return 1
     ensure_src()
     auto_update_upstream()

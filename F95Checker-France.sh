@@ -81,16 +81,16 @@ if [[ ! -f "$BAT_FILE" ]]; then
     exit 1
 fi
 
-# Choix de l'interpreteur Python systeme (3.11+ requis), uniquement pour creer le venv
+# Choix de l'interpreteur Python systeme (3.12 ou 3.11 ; pas python3, souvent trop recent), uniquement pour creer le venv
 SYSPY=""
-for cand in python3.12 python3.11 python3; do
+for cand in python3.12 python3.11; do
     if command -v "$cand" >/dev/null 2>&1; then
         SYSPY="$cand"
         break
     fi
 done
 if [[ -z "$SYSPY" ]]; then
-    echo "Python 3.11+ requis. Installe-le via ton gestionnaire de paquets (ex: sudo pacman -S python)." >&2
+    echo "Python 3.12 (ou 3.11) requis. Installe-le via ton gestionnaire de paquets (ex: paru -S python312)." >&2
     exit 1
 fi
 
