@@ -517,6 +517,16 @@ GLOBALS_STARTCMD_NEW = """    if os is Os.Windows:
             start_cmd = " ".join(f'"{split}"' for split in start_cmd)
         autostart = pathlib.Path("SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\\F95Checker")"""
 
+# Apercus LewdCorner : passer par lc_games._fetch_page plutot que api.download_image,
+# qui enverrait les cookies de session F95zone a lewdcorner.com
+STRUCTS_PREVIEW_OLD = """                    data, _ = await api.download_image(url)"""
+
+STRUCTS_PREVIEW_NEW = """                    if "lewdcorner.com" in url:
+                        from modules import lc_games
+                        data, _ = await lc_games._fetch_page(url)
+                    else:
+                        data, _ = await api.download_image(url)"""
+
 CALLBACKS_FUZZY_OLD = """def _fuzzy_match_subdir(where: pathlib.Path, match: str, best_partial_match: bool):
     clean_dir = utils.clean_str(match)
     if (where / clean_dir).is_dir():
@@ -877,6 +887,16 @@ def apply_lc_patches() -> None:
         import py_compile
         py_compile.compile(str(callbacks_module), doraise=True)
         print("Detection du dossier d'executable amelioree (callbacks.py).")
+
+    structs_module = SRC / "common" / "structs.py"
+    structs_text = structs_module.read_text(encoding="utf-8")
+    if "lc_games" not in structs_text:
+        if STRUCTS_PREVIEW_OLD not in structs_text:
+            raise SystemExit("structs.py a change : patch apercus LewdCorner impossible.")
+        structs_module.write_text(structs_text.replace(STRUCTS_PREVIEW_OLD, STRUCTS_PREVIEW_NEW, 1), encoding="utf-8")
+        import py_compile
+        py_compile.compile(str(structs_module), doraise=True)
+        print("Apercus LewdCorner telecharges avec les cookies LewdCorner (structs.py).")
 
     if changed:
         _rezip(browser / "chrome", browser / "chrome.zip")
@@ -1756,16 +1776,23 @@ async def _parse_page(html: bytes, url: str = ""):
     description = f95_parser.fixed_spaces(f95_parser.sanitize_whitespace(description)) if description else ""
 
     image_url = "missing"
+    previews_urls = []
     if post is not None:
-        img = post.find(lambda elem: elem.name == "img" and "bbImage" in (elem.get("class") or []))
-        if img:
-            image_url = img.get("data-src") or img.get("src") or "missing"
+        imgs = post.find_all(lambda elem: elem.name == "img" and "bbImage" in (elem.get("class") or []))
+        if imgs:
+            image_url = imgs[0].get("data-src") or imgs[0].get("src") or "missing"
+        # Miniatures /data/attachments/...?hash= (accessibles sans connexion, contrairement
+        # aux originaux /attachments/...), dans l'ordre du post, sans la couverture
+        for img in imgs[1:]:
+            src = img.get("data-src") or img.get("src") or ""
+            if src.startswith(("http://", "https://")) and src != image_url and src not in previews_urls:
+                previews_urls.append(src)
 
     parsed = SimpleNamespace(
         name=name, thread_version=version, developer=developer, type=type_, status=status,
         last_updated=last_updated, score=score, votes=votes, description=description,
         changelog="", tags=tags, unknown_tags=tuple(unknown_tags), image_url=image_url,
-        previews_urls=[], downloads=(),
+        previews_urls=previews_urls, downloads=(),
     )
     return parsed, None
 
@@ -1827,6 +1854,7 @@ async def _scrape_and_apply(game, updates: dict | None = None) -> tuple[bool, st
     game.changelog = parsed.changelog
     game.tags = parsed.tags
     game.unknown_tags = tuple(parsed.unknown_tags)
+    game.previews_urls = parsed.previews_urls
     if image_bytes:
         await game.set_image_async(image_bytes)
         game.image_url = parsed.image_url
