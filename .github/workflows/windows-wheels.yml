@@ -1,0 +1,63 @@
+# Compile les dependances de F95Checker qui n'ont pas de wheel Windows sur PyPI
+# pour les versions de Python supportees (imgui, zipfile-deflate64), et les publie
+# dans la release "windows-wheels". setup_france.py les telecharge avant le
+# pip install, ce qui evite aux utilisateurs Windows d'installer MSVC.
+name: Windows wheels
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/windows-wheels.yml"]
+  schedule:
+    # Chaque lundi : suit les changements de version dans le requirements.txt amont
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        python: ["3.12", "3.11"]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: x64
+
+      - name: Build wheels
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/WillyJL/F95Checker/main/requirements.txt -o requirements.txt
+          grep -E '^(imgui|zipfile-deflate64)==' requirements.txt > to-build.txt
+          cat to-build.txt
+          python -m pip install -U pip wheel setuptools
+          python -m pip wheel --no-deps -r to-build.txt -w wheels
+          ls wheels
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.python }}
+          path: wheels/*.whl
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view windows-wheels >/dev/null 2>&1 || gh release create windows-wheels \
+            --title "Wheels Windows" \
+            --notes "Wheels precompilees (imgui, zipfile-deflate64) telechargees automatiquement par le launcher Windows. Mises a jour par le workflow windows-wheels."
+          gh release upload windows-wheels wheels/*.whl --clobber

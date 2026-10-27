@@ -111,9 +111,11 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +125,8 @@ SRC = ROOT / "F95Checker-src"
 INI = CACHE_DIR / "france_labels.ini"
 REPO = "https://github.com/WillyJL/F95Checker.git"
 BROKEN_MARKER = CACHE_DIR / "broken_commit.txt"
+# Wheels Windows compilees par .github/workflows/windows-wheels.yml
+WHEELS_RELEASE_API = "https://api.github.com/repos/Hunteraulo1/f95list-f95checker/releases/tags/windows-wheels"
 PATCHED_FILES_TO_VERIFY = (
     "main.py",
     "modules/gui.py",
@@ -1038,6 +1042,28 @@ def ensure_config(force: bool = False) -> None:
     write_ini(prompt_api_key())
 
 
+def download_prebuilt_wheels() -> Path | None:
+    """Windows : imgui et zipfile-deflate64 n'ont pas de wheel PyPI pour Python 3.12,
+    pip devrait les compiler (MSVC requis). On recupere celles publiees par la CI du
+    depot. None si indisponibles : pip compilera comme avant."""
+    if sys.platform != "win32":
+        return None
+    suffix = f"-cp{sys.version_info.major}{sys.version_info.minor}-win_amd64.whl"
+    dest = CACHE_DIR / "wheels"
+    try:
+        with urllib.request.urlopen(WHEELS_RELEASE_API, timeout=30) as resp:
+            assets = json.load(resp)["assets"]
+        dest.mkdir(parents=True, exist_ok=True)
+        for asset in assets:
+            name = asset["name"]
+            if name.endswith(suffix) and not (dest / name).is_file():
+                urllib.request.urlretrieve(asset["browser_download_url"], dest / name)
+    except Exception as exc:
+        print(f"Wheels precompilees indisponibles ({exc}), pip compilera si besoin.")
+        return None
+    return dest
+
+
 def ensure_deps(py_cmd: list[str]) -> None:
     # Le marqueur retient l'interpreteur : F95Checker-src peut etre partage entre
     # Windows et Linux (dual boot), et un changement de version de Python impose
@@ -1047,11 +1073,10 @@ def ensure_deps(py_cmd: list[str]) -> None:
     if marker.is_file() and marker.read_text(encoding="utf-8").strip() == stamp:
         return
     print("Dependances (une fois, patientez)...")
-    subprocess.run(
-        [*py_cmd, "-m", "pip", "install", "-q", "-U", "-r", "requirements.txt"],
-        check=True,
-        cwd=SRC,
-    )
+    cmd = [*py_cmd, "-m", "pip", "install", "-q", "-U", "-r", "requirements.txt"]
+    if (wheels := download_prebuilt_wheels()) is not None:
+        cmd += ["--find-links", str(wheels)]
+    subprocess.run(cmd, check=True, cwd=SRC)
     marker.write_text(stamp, encoding="utf-8")
 
 
