@@ -1434,6 +1434,14 @@ _THREAD_RE = re.compile(r"threads/(?:([^./]*)\.)?(\d+)")
 _session_expired_games: list[str] = []
 # Autres echecs (502, timeout...) regroupes par message d'erreur, meme principe
 _failed_games: dict[str, list[str]] = {}
+# Debit des refresh LC : sans limite, aiohttp ouvre jusqu'a 100 connexions d'un coup,
+# ce qui fait bannir l'IP (surtout une IP VPN partagee) par l'anti-flood du site
+_LC_MAX_CONCURRENT = 2
+_LC_REQUEST_DELAY = 1.0
+_lc_sem = None
+# Erreur bloquante (403/429/5xx) rencontree pendant le refresh en cours : les jeux
+# restants ne sont plus demandes, pour ne pas insister sur un site qui refuse
+_lc_abort_error: str | None = None
 _LC_URL_RE = re.compile(r"\S*lewdcorner\.com/threads/(?:[^./\s]*\.)?\d+\S*", re.IGNORECASE)
 
 
@@ -1857,8 +1865,18 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
     from common.structs import MsgBox
     from modules import globals, msgbox, utils
 
+    global _lc_abort_error
+    import asyncio
+
     try:
-        success, error_msg = await _scrape_and_apply(game, updates)
+        async with _lc_sem:
+            if _lc_abort_error:
+                success, error_msg = False, _lc_abort_error
+            else:
+                success, error_msg = await _scrape_and_apply(game, updates)
+                if not success and re.search(r"HTTP (403|429|5\d\d)|REQUIRED_READING", error_msg):
+                    _lc_abort_error = error_msg
+                await asyncio.sleep(_LC_REQUEST_DELAY)
         if not success:
             if "HTTP 403" in error_msg or error_msg == "REQUIRED_READING":
                 # Le 403 sur LewdCorner vient quasi toujours d'une session/cookie
@@ -1887,8 +1905,11 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
     import asyncio
     from modules import globals
 
+    global _lc_sem, _lc_abort_error
     if not games:
         return []
+    _lc_sem = asyncio.Semaphore(_LC_MAX_CONCURRENT)
+    _lc_abort_error = None
     ok, err = await check_lc_session()
     if not ok and err and ("HTTP 403" in err or err == "REQUIRED_READING"):
         _session_expired_games.extend(game.name for game in games)
