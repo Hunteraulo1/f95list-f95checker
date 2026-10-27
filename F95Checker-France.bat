@@ -1856,8 +1856,30 @@ async def check_lc_session() -> tuple[bool, str | None]:
     par jeu. Une session/cookie 'cf_clearance' perime bloque TOUTES les requetes de la
     meme facon (pas juste certains jeux), donc un seul aller-retour ici evite d'envoyer
     N requetes vouees a echouer identiquement en 403. Renvoie (ok, erreur)."""
-    html, err = await _fetch_page(f"https://{LC_HOST_MARKER}/")
-    return html is not None, err
+    from modules import api
+
+    if not is_lc_logged_in():
+        return False, "LOGIN_REQUIRED"
+    try:
+        # Sans suivre les redirections : avec des cookies expires, LewdCorner boucle
+        # indefiniment vers /login/two-step au lieu de renvoyer une erreur
+        async with api.request(
+            "GET", f"https://{LC_HOST_MARKER}/", cookies=_load_lc_cookies(), timeout=30,
+            headers=_LC_BROWSER_HEADERS, allow_redirects=False,
+        ) as (res, req):
+            if 300 <= req.status < 400:
+                if "/login" in req.headers.get("Location", ""):
+                    return False, "LOGIN_REQUIRED"
+                return False, f"HTTP {req.status}"
+            if req.status >= 400:
+                if req.status == 403 and b"required reading" in res.lower():
+                    return False, "REQUIRED_READING"
+                return False, f"HTTP {req.status}"
+            if b'data-logged-in="true"' not in res:
+                return False, "LOGIN_REQUIRED"
+            return True, None
+    except Exception as exc:
+        return False, (f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
 
 
 async def refresh_lc_game(game, updates: dict | None = None) -> None:
@@ -1874,11 +1896,11 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
                 success, error_msg = False, _lc_abort_error
             else:
                 success, error_msg = await _scrape_and_apply(game, updates)
-                if not success and re.search(r"HTTP (403|429|5\d\d)|REQUIRED_READING", error_msg):
+                if not success and re.search(r"HTTP (403|429|5\d\d)|REQUIRED_READING|TooManyRedirects", error_msg):
                     _lc_abort_error = error_msg
                 await asyncio.sleep(_LC_REQUEST_DELAY)
         if not success:
-            if "HTTP 403" in error_msg or error_msg == "REQUIRED_READING":
+            if "HTTP 403" in error_msg or "TooManyRedirects" in error_msg or error_msg == "REQUIRED_READING":
                 # Le 403 sur LewdCorner vient quasi toujours d'une session/cookie
                 # Cloudflare (cf_clearance) perimee ou liee a une autre IP que celle
                 # de ce client HTTP, pas d'un vrai probleme par jeu. Regrouper ces
@@ -1911,7 +1933,9 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
     _lc_sem = asyncio.Semaphore(_LC_MAX_CONCURRENT)
     _lc_abort_error = None
     ok, err = await check_lc_session()
-    if not ok and err and ("HTTP 403" in err or err == "REQUIRED_READING"):
+    if err == "LOGIN_REQUIRED" and await lc_login():
+        ok, err = await check_lc_session()
+    if not ok and err and ("HTTP 403" in err or err in ("REQUIRED_READING", "LOGIN_REQUIRED")):
         _session_expired_games.extend(game.name for game in games)
         globals.refresh_progress += len(games)
         return []
@@ -1945,7 +1969,7 @@ def report_session_expired() -> None:
     _session_expired_games.clear()
     utils.push_popup(
         msgbox.msgbox, "LewdCorner",
-        f"{len(names)} jeu(x) LewdCorner non verifie(s) : session expiree ou refusee (HTTP 403).\n"
+        f"{len(names)} jeu(x) LewdCorner non verifie(s) : session expiree ou refusee.\n"
         "Reconnectez-vous via le bouton Se connecter dans la sidebar LewdCorner.",
         MsgBox.warn,
         more="\n".join(names),
