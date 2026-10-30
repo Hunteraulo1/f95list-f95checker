@@ -213,6 +213,18 @@ GUI_SNIPPET = '''
 
 '''
 
+GUI_STATUS_OLD = """                        elif globals.last_update_check is None:
+                            text = "Checking for updates..."
+"""
+
+GUI_STATUS_NEW = """                        elif lc_status := lc_games.status_text():
+                            text = lc_status
+                        elif france_labels.is_busy():
+                            text = "Synchronisation F95-France..."
+                        elif france_labels.is_checking_updates():
+                            text = "Verification des mises a jour..."
+""" + GUI_STATUS_OLD
+
 GUI_UPDATE_CHECK_OLD = """            if france_labels.last_result():
                 draw_settings_label(france_labels.last_result())"""
 
@@ -984,6 +996,14 @@ def apply_lc_patches() -> None:
         gui.write_text(gui_text, encoding="utf-8")
         verify_gui()
         print("Barre d'ajout, import, section Connexion et bouton Recheck LewdCorner ajoutes (gui.py).")
+
+    gui_text = gui.read_text(encoding="utf-8")
+    if "lc_games.status_text" not in gui_text:
+        if GUI_STATUS_OLD not in gui_text:
+            raise SystemExit("gui.py a change : patch texte de progression impossible.")
+        gui.write_text(gui_text.replace(GUI_STATUS_OLD, GUI_STATUS_NEW, 1), encoding="utf-8")
+        verify_gui()
+        print("Progression LewdCorner affichee en bas de fenetre (gui.py).")
 
     api_module = SRC / "modules" / "api.py"
     api_text = api_module.read_text(encoding="utf-8")
@@ -1782,6 +1802,10 @@ _lc_sem = None
 # restants ne sont plus demandes, pour ne pas insister sur un site qui refuse
 _lc_abort_error: str | None = None
 LC_LOGIN_SNOOZE = 24 * 60 * 60
+_lc_remaining = 0
+_session_expired_reason = ""
+_status_login = False
+_status_session = False
 _LC_URL_RE = re.compile(r"\S*lewdcorner\.com/threads/(?:[^./\s]*\.)?\d+\S*", re.IGNORECASE)
 
 
@@ -2258,12 +2282,34 @@ async def check_lc_session() -> tuple[bool, str | None]:
         return False, (f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
 
 
+def status_text() -> str:
+    """Texte de progression en bas de fenetre, comme les etapes de refresh de F95Checker."""
+    from modules import utils
+
+    if _status_login:
+        return "En attente de la connexion LewdCorner..."
+    if _status_session:
+        return "Verification de la session LewdCorner..."
+    # is_refreshing : un refresh annule peut laisser des taches jamais demarrees dans le compte
+    if _lc_remaining > 0 and utils.is_refreshing():
+        return f"LewdCorner : {_lc_remaining} jeu{'x' if _lc_remaining > 1 else ''} restant{'s' if _lc_remaining > 1 else ''}..."
+    return ""
+
+
+def _session_failure_text(reason: str) -> str:
+    if reason == "LOGIN_REQUIRED":
+        return "LewdCorner ne reconnait pas la session."
+    if reason == "REQUIRED_READING":
+        return "Un sujet en lecture obligatoire doit etre ouvert sur LewdCorner dans un navigateur."
+    return reason
+
+
 async def refresh_lc_game(game, updates: dict | None = None) -> None:
     """Refresh d'un jeu custom LewdCorner, lance par start_refresh()."""
     from common.structs import MsgBox
     from modules import globals, msgbox, utils
 
-    global _lc_abort_error
+    global _lc_abort_error, _lc_remaining, _session_expired_reason
     import asyncio
 
     try:
@@ -2283,6 +2329,7 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
                 # echecs en un seul message (voir api.refresh) au lieu de spammer
                 # une popup par jeu.
                 _session_expired_games.append(game.name)
+                _session_expired_reason = error_msg
             else:
                 _failed_games.setdefault(error_msg, []).append(game.name)
     except Exception:
@@ -2294,6 +2341,7 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
             more=error.traceback(),
         )
     finally:
+        _lc_remaining -= 1
         globals.refresh_progress += 1
 
 
@@ -2303,20 +2351,31 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
     import asyncio
     from modules import globals
 
-    global _lc_sem, _lc_abort_error
+    global _lc_sem, _lc_abort_error, _lc_remaining, _session_expired_reason, _status_login, _status_session
     if not games:
         return []
     _lc_sem = asyncio.Semaphore(_LC_MAX_CONCURRENT)
     _lc_abort_error = None
-    ok, err = await check_lc_session()
-    # F95Checker en arriere-plan : pas de fenetre de connexion surprise, comme le captcha d'api.py
-    if err == "LOGIN_REQUIRED" and not globals.gui.hidden and not _is_login_snoozed():
-        if await lc_login():
-            ok, err = await check_lc_session()
-        else:
-            _snooze_login()
+    _lc_remaining = 0
+    _status_session = True
+    try:
+        ok, err = await check_lc_session()
+        # F95Checker en arriere-plan : pas de fenetre de connexion surprise, comme le captcha d'api.py
+        if err == "LOGIN_REQUIRED" and not globals.gui.hidden and not _is_login_snoozed():
+            _status_login = True
+            try:
+                logged_in = await lc_login()
+            finally:
+                _status_login = False
+            if logged_in:
+                ok, err = await check_lc_session()
+            else:
+                _snooze_login()
+    finally:
+        _status_session = False
     if not ok and err and ("HTTP 403" in err or err in ("REQUIRED_READING", "LOGIN_REQUIRED")):
         _session_expired_games.extend(game.name for game in games)
+        _session_expired_reason = err
         globals.refresh_progress += len(games)
         return []
     if not ok:
@@ -2324,6 +2383,7 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
         _failed_games.setdefault(f"LewdCorner injoignable ({err}).", []).extend(game.name for game in games)
         globals.refresh_progress += len(games)
         return []
+    _lc_remaining = len(games)
     return [asyncio.create_task(refresh_lc_game(game, updates)) for game in games]
 
 
@@ -2354,6 +2414,7 @@ def report_session_expired() -> None:
     utils.push_popup(
         msgbox.msgbox, "LewdCorner",
         f"{len(names)} jeu(x) LewdCorner non verifie(s) : session expiree ou refusee.\n"
+        f"Cause : {_session_failure_text(_session_expired_reason)}\n"
         "Reconnectez-vous via le bouton Se connecter dans la sidebar LewdCorner.",
         MsgBox.warn,
         more="\n".join(names),
