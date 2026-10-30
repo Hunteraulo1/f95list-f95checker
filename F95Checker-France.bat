@@ -506,7 +506,7 @@ GLOBALS_STARTCMD_OLD = """    if os is Os.Windows:
         start_cmd = " ".join(f'"{split}"' for split in start_cmd)
         autostart = pathlib.Path("SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\\F95Checker")"""
 
-GLOBALS_STARTCMD_NEW = """    if os is Os.Windows:
+GLOBALS_STARTCMD_PREVIOUS = """    if os is Os.Windows:
         import winreg
         _france_root = pathlib.Path(__file__).resolve().parents[2]
         _france_bat = _france_root / "F95Checker-France.bat"
@@ -516,6 +516,35 @@ GLOBALS_STARTCMD_NEW = """    if os is Os.Windows:
         else:
             start_cmd = " ".join(f'"{split}"' for split in start_cmd)
         autostart = pathlib.Path("SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\\F95Checker")"""
+
+# Le .vbs ne transmet pas d'arguments : les sous-processus (webview, notifications)
+# doivent lancer main.py directement, sinon ils relancent juste le .bat.
+GLOBALS_STARTCMD_NEW = """    if os is Os.Windows:
+        import winreg
+        start_cmd = " ".join(f'"{split}"' for split in start_cmd)
+        daemon_cmd = start_cmd
+        _france_root = pathlib.Path(__file__).resolve().parents[2]
+        _france_bat = _france_root / "F95Checker-France.bat"
+        _france_vbs = _france_root / "._f95_france_cache" / "silent_launch.vbs"
+        if _france_bat.is_file() and _france_vbs.is_file():
+            start_cmd = f'wscript.exe //B "{_france_vbs}" "{_france_bat}"'
+        autostart = pathlib.Path("SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\\F95Checker")"""
+
+GLOBALS_DAEMONCMD_OLD = """start_cmd = None
+autostart = None
+start_with_system = None
+def _():
+    global start_cmd, autostart, start_with_system"""
+
+GLOBALS_DAEMONCMD_NEW = """start_cmd = None
+daemon_cmd = None
+autostart = None
+start_with_system = None
+def _():
+    global start_cmd, daemon_cmd, autostart, start_with_system"""
+
+DAEMON_SPAWN_OLD = "*shlex.split(globals.start_cmd),"
+DAEMON_SPAWN_NEW = "*shlex.split(globals.daemon_cmd or globals.start_cmd),"
 
 # Apercus LewdCorner : passer par lc_games._fetch_page plutot que api.download_image,
 # qui enverrait les cookies de session F95zone a lewdcorner.com
@@ -866,13 +895,24 @@ def apply_lc_patches() -> None:
 
     globals_module = SRC / "modules" / "globals.py"
     globals_text = globals_module.read_text(encoding="utf-8")
-    if "_france_bat" not in globals_text:
-        if GLOBALS_STARTCMD_OLD not in globals_text:
+    if "daemon_cmd" not in globals_text:
+        # PREVIOUS : installations deja patchees avant l'ajout de daemon_cmd
+        startcmd_old = GLOBALS_STARTCMD_PREVIOUS if GLOBALS_STARTCMD_PREVIOUS in globals_text else GLOBALS_STARTCMD_OLD
+        if startcmd_old not in globals_text or GLOBALS_DAEMONCMD_OLD not in globals_text:
             raise SystemExit("globals.py a change : patch Start with System impossible.")
-        globals_module.write_text(globals_text.replace(GLOBALS_STARTCMD_OLD, GLOBALS_STARTCMD_NEW, 1), encoding="utf-8")
+        globals_text = globals_text.replace(startcmd_old, GLOBALS_STARTCMD_NEW, 1)
+        globals_module.write_text(globals_text.replace(GLOBALS_DAEMONCMD_OLD, GLOBALS_DAEMONCMD_NEW, 1), encoding="utf-8")
         import py_compile
         py_compile.compile(str(globals_module), doraise=True)
         print("Start with System redirige via le .bat (globals.py).")
+
+    for daemon_module in (SRC / "modules" / "webview.py", SRC / "modules" / "notification_proc.py"):
+        daemon_text = daemon_module.read_text(encoding="utf-8")
+        if DAEMON_SPAWN_NEW not in daemon_text:
+            if DAEMON_SPAWN_OLD not in daemon_text:
+                raise SystemExit(f"{daemon_module.name} a change : patch sous-processus impossible.")
+            daemon_module.write_text(daemon_text.replace(DAEMON_SPAWN_OLD, DAEMON_SPAWN_NEW, 1), encoding="utf-8")
+            print(f"Sous-processus lances sans le .bat ({daemon_module.name}).")
 
     callbacks_module = SRC / "modules" / "callbacks.py"
     callbacks_text = callbacks_module.read_text(encoding="utf-8")
