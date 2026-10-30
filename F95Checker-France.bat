@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-REM Mise a jour auto du launcher (.bat + .sh) depuis GitHub (laisser vide pour desactiver) :
+REM Mise a jour auto du launcher (.bat + .sh) depuis GitHub (laisser vide pour la desactiver) :
 set "UPDATE_REPO_RAW=https://raw.githubusercontent.com/Hunteraulo1/f95list-f95checker/main"
 
 if /i "%~1"=="--no-update" (
