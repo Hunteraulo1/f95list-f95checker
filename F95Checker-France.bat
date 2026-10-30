@@ -9,6 +9,11 @@ if /i "%~1"=="--no-update" (
     shift
     set "UPDATE_REPO_RAW="
 )
+REM Demarrage avec Windows : on demande avant de mettre a jour le launcher
+if /i "%~1"=="--startup" (
+    shift
+    set "UPDATE_PROMPT=1"
+)
 if defined UPDATE_REPO_RAW call :self_update
 if errorlevel 1 exit /b 0
 
@@ -84,7 +89,9 @@ set "UPDATE_HELPER=%~dp0._f95_france_cache\apply_self_update.cmd"
 set "SH_TARGET=%~dp0F95Checker-France.sh"
 set "SELF_BAT=%~f0"
 set "F95_RELUNCH_ARGS=%*"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference='Stop'; $base=$env:UPDATE_REPO_RAW; $batChanged=$false; try { Invoke-WebRequest -Uri ($base+'/F95Checker-France.bat') -OutFile $env:UPDATE_TMP -UseBasicParsing -TimeoutSec 30; $a=(Get-FileHash -Algorithm SHA256 $env:UPDATE_TMP).Hash; $b=(Get-FileHash -Algorithm SHA256 $env:SELF_BAT).Hash; if($a -ne $b){ $batChanged=$true } else { Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue } } catch { $batChanged=$false }; try { $tmpSh=[IO.Path]::GetTempFileName(); Invoke-WebRequest -Uri ($base+'/F95Checker-France.sh') -OutFile $tmpSh -UseBasicParsing -TimeoutSec 30; $needSh=$true; if(Test-Path $env:SH_TARGET){ $c=(Get-FileHash -Algorithm SHA256 $tmpSh).Hash; $d=(Get-FileHash -Algorithm SHA256 $env:SH_TARGET).Hash; $needSh=($c -ne $d) }; if($needSh){ Copy-Item $tmpSh $env:SH_TARGET -Force; Write-Host 'F95Checker-France.sh mis a jour (pour tes utilisateurs Linux).' }; Remove-Item $tmpSh -ErrorAction SilentlyContinue } catch {}; if($batChanged){ exit 1 } else { exit 0 } }"
+if defined UPDATE_PROMPT set "F95_RELUNCH_ARGS=--no-update"
+set "UPDATE_DECLINED=%~dp0._f95_france_cache\declined_launcher_update.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference='Stop'; $base=$env:UPDATE_REPO_RAW; $batChanged=$false; try { Invoke-WebRequest -Uri ($base+'/F95Checker-France.bat') -OutFile $env:UPDATE_TMP -UseBasicParsing -TimeoutSec 30; $a=(Get-FileHash -Algorithm SHA256 $env:UPDATE_TMP).Hash; $b=(Get-FileHash -Algorithm SHA256 $env:SELF_BAT).Hash; if($a -ne $b){ $batChanged=$true } else { Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue } } catch { $batChanged=$false }; if($batChanged -and $env:UPDATE_PROMPT){ if((Test-Path $env:UPDATE_DECLINED) -and ((Get-Content $env:UPDATE_DECLINED -Raw).Trim() -eq $a)){ Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue; exit 0 }; Add-Type -AssemblyName System.Windows.Forms; $owner=New-Object System.Windows.Forms.Form -Property @{TopMost=$true}; $answer=[System.Windows.Forms.MessageBox]::Show($owner,'Une nouvelle version du launcher F95Checker France est disponible. Mettre a jour maintenant ?','F95Checker France',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question); if($answer -ne [System.Windows.Forms.DialogResult]::Yes){ Set-Content -Path $env:UPDATE_DECLINED -Value $a; Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue; exit 0 } }; try { $tmpSh=[IO.Path]::GetTempFileName(); Invoke-WebRequest -Uri ($base+'/F95Checker-France.sh') -OutFile $tmpSh -UseBasicParsing -TimeoutSec 30; $needSh=$true; if(Test-Path $env:SH_TARGET){ $c=(Get-FileHash -Algorithm SHA256 $tmpSh).Hash; $d=(Get-FileHash -Algorithm SHA256 $env:SH_TARGET).Hash; $needSh=($c -ne $d) }; if($needSh){ Copy-Item $tmpSh $env:SH_TARGET -Force; Write-Host 'F95Checker-France.sh mis a jour (pour tes utilisateurs Linux).' }; Remove-Item $tmpSh -ErrorAction SilentlyContinue } catch {}; if($batChanged){ exit 1 } else { exit 0 } }"
 if errorlevel 1 goto :self_update_apply_bat
 goto :eof
 
@@ -174,6 +181,21 @@ GUI_SNIPPET = '''
             imgui.end_table()
 
 '''
+
+GUI_UPDATE_CHECK_OLD = """            if france_labels.last_result():
+                draw_settings_label(france_labels.last_result())"""
+
+GUI_UPDATE_CHECK_NEW = GUI_UPDATE_CHECK_OLD + """
+            draw_settings_label("Mises a jour")
+            update_check_disabled = france_labels.is_checking_updates()
+            if update_check_disabled:
+                imgui.push_disabled()
+            if imgui.button("Verifier", width=right_width):
+                async_thread.run(france_labels.check_updates_from_gui())
+            if update_check_disabled:
+                imgui.pop_disabled()
+            if france_labels.last_update_result():
+                draw_settings_label(france_labels.last_update_result())"""
 
 GUI_ANCHOR = """            imgui.end_table()
             imgui.spacing()
@@ -965,6 +987,11 @@ def apply_patches() -> None:
             raise SystemExit("gui.py a change : mise a jour F95Checker non compatible.")
         text = text.replace(GUI_ANCHOR, GUI_ANCHOR_REPLACEMENT, 1)
         print("Bouton F95-France ajoute dans la sidebar.")
+    if "check_updates_from_gui" not in text:
+        if GUI_UPDATE_CHECK_OLD not in text:
+            raise SystemExit("gui.py a change : patch bouton mises a jour impossible.")
+        text = text.replace(GUI_UPDATE_CHECK_OLD, GUI_UPDATE_CHECK_NEW, 1)
+        print("Bouton de verification des mises a jour ajoute (gui.py).")
     if "france_labels," not in text:
         if GUI_IMPORT_OLD not in text:
             raise SystemExit("Import france_labels impossible dans gui.py.")
@@ -1150,7 +1177,9 @@ from __future__ import annotations
 import asyncio
 import configparser
 import json
+import shutil
 import sqlite3
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -1159,6 +1188,7 @@ from pathlib import Path
 from common.structs import Label
 
 API_URL = "https://f95france.site/api/games"
+LAUNCHER_RAW_URL = "https://raw.githubusercontent.com/Hunteraulo1/f95list-f95checker/main/F95Checker-France.bat"
 LC_HOST_MARKER = "lewdcorner.com"
 FRANCE_LABEL_NAME = "F95France"
 FRANCE_LABEL_COLOR_HEX = "#4CAF50"
@@ -1174,6 +1204,8 @@ _HTTP_HEADERS = {
 
 _busy = False
 _last_result = ""
+_checking_updates = False
+_last_update_result = ""
 
 
 def _appdata_dir() -> Path:
@@ -1429,6 +1461,98 @@ async def sync_from_gui() -> None:
         )
     finally:
         _busy = False
+
+
+def is_checking_updates() -> bool:
+    return _checking_updates
+
+
+def last_update_result() -> str:
+    return _last_update_result
+
+
+def _check_launcher(root: Path) -> tuple[bool, str]:
+    """Compare le .bat local au .bat publie sur GitHub."""
+    req = urllib.request.Request(LAUNCHER_RAW_URL, headers=_HTTP_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            remote = resp.read()
+        local = (root / "F95Checker-France.bat").read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Launcher : verification impossible ({exc}).") from exc
+    if remote == local:
+        return False, "Launcher : a jour."
+    return True, "Launcher : nouvelle version disponible."
+
+
+def _git_output(src: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=src, capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or f"git {args[0]} a echoue")
+    return result.stdout.strip()
+
+
+def _check_upstream(src: Path) -> tuple[bool, str]:
+    """Compare le commit installe au dernier commit de F95Checker."""
+    if not shutil.which("git"):
+        raise ValueError("F95Checker : verification impossible (Git introuvable).")
+    try:
+        local = _git_output(src, "rev-parse", "HEAD")
+        remote = _git_output(src, "ls-remote", "origin", "refs/heads/main").split()[0]
+    except (ValueError, OSError, IndexError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"F95Checker : verification impossible ({exc}).") from exc
+    if remote == local:
+        return False, "F95Checker : a jour."
+    return True, f"F95Checker : nouvelle version disponible ({local[:7]} -> {remote[:7]})."
+
+
+def _check_updates() -> tuple[bool, bool, list[str]]:
+    root = Path(__file__).resolve().parents[2]
+    available = failed = False
+    lines = []
+    for check, target in ((_check_launcher, root), (_check_upstream, root / "F95Checker-src")):
+        try:
+            found, line = check(target)
+            available = available or found
+        except ValueError as exc:
+            failed = True
+            line = str(exc)
+        lines.append(line)
+    return available, failed, lines
+
+
+async def check_updates_from_gui() -> None:
+    from common.structs import MsgBox
+    from external import error
+    from modules import msgbox, utils
+    global _checking_updates, _last_update_result
+    if _checking_updates:
+        return
+    _checking_updates = True
+    _last_update_result = "Verification..."
+    try:
+        loop = asyncio.get_event_loop()
+        available, failed, lines = await loop.run_in_executor(None, _check_updates)
+        if available:
+            _last_update_result = "Mise a jour disponible"
+            lines.append("\nFermez F95Checker puis relancez F95Checker-France pour l'installer.")
+        else:
+            _last_update_result = "Verification incomplete" if failed else "Tout est a jour"
+        utils.push_popup(
+            msgbox.msgbox, "F95-France", "\n".join(lines),
+            MsgBox.warn if failed else MsgBox.info,
+        )
+    except Exception:
+        _last_update_result = "Erreur"
+        utils.push_popup(
+            msgbox.msgbox, "F95-France", error.text(), MsgBox.error, more=error.traceback()
+        )
+    finally:
+        _checking_updates = False
 @@END_FRANCE_LABELS@@
 @@BEGIN_FRANCE_ICON@@
 """Icone F95Checker sous Windows (pythonw affiche sinon l'icone Python)."""
@@ -2141,5 +2265,5 @@ async def add_lc_games(urls: list[str]) -> None:
 @@END_LC_GAMES@@
 @@BEGIN_SILENT_LAUNCHER@@
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """" & WScript.Arguments(0) & """ --no-update", 0, False
+WshShell.Run """" & WScript.Arguments(0) & """ --startup", 0, False
 @@END_SILENT_LAUNCHER@@
