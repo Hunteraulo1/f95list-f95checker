@@ -9,16 +9,25 @@ if /i "%~1"=="--no-update" (
     shift
     set "UPDATE_REPO_RAW="
 )
-REM Demarrage avec Windows : on demande avant de mettre a jour le launcher
+REM Demarrage avec Windows : on demande avant de mettre a jour le launcher.
+REM La console est cachee : un "pause" bloquerait indefiniment sans que personne le voie.
+set "PAUSE_CMD=pause"
 if /i "%~1"=="--startup" (
     shift
     set "UPDATE_PROMPT=1"
+    set "PAUSE_CMD=call"
 )
 if defined UPDATE_REPO_RAW call :self_update
 if errorlevel 1 exit /b 0
 
 set "RUNTIME=%~dp0._f95_france_cache"
 set "SRCDIR=%~dp0F95Checker-src"
+set "PRIVATE_PY_DIR=%RUNTIME%\python312"
+set "PRIVATE_PY=%PRIVATE_PY_DIR%\python.exe"
+REM Dossier partage (dual boot) : Git le refuserait comme "dubious ownership"
+set "GIT_CONFIG_COUNT=1"
+set "GIT_CONFIG_KEY_0=safe.directory"
+set "GIT_CONFIG_VALUE_0=*"
 set "EXTRA="
 set "DO_LAUNCH=1"
 if /i "%~1"=="reconfigure" set "EXTRA=--reconfigure" & set "DO_LAUNCH=0"
@@ -28,17 +37,20 @@ if /i "%~1"=="setup-only" set "EXTRA=--setup-only" & set "DO_LAUNCH=0"
 REM Pas de "py -3" : il prend la version la plus recente (ex. 3.14), incompatible
 set "PY="
 for %%V in (3.12 3.11) do if not defined PY py -%%V --version >nul 2>&1 && set "PY=py -%%V"
+if not defined PY python -c "import sys; sys.exit(sys.version_info[:2] not in ((3, 12), (3, 11)))" >nul 2>&1 && set "PY=python"
+if not defined PY if exist "%PRIVATE_PY%" set PY="%PRIVATE_PY%"
+if not defined PY call :install_python
 if not defined PY (
-    echo Python 3.12 requis. Installez-le avec : py install 3.12
-    echo ou via https://www.python.org/downloads/
-    pause
+    echo Installation automatique de Python impossible. Verifiez votre connexion et relancez.
+    echo Vous pouvez aussi installer Python 3.12 via https://www.python.org/downloads/
+    %PAUSE_CMD%
     exit /b 1
 )
 
 if not exist "%RUNTIME%" mkdir "%RUNTIME%"
 call :extract_embedded || (
     echo Echec extraction des scripts integres.
-    pause
+    %PAUSE_CMD%
     exit /b 1
 )
 
@@ -48,22 +60,25 @@ echo.
 
 %PY% "%RUNTIME%\setup_france.py" %EXTRA%
 if errorlevel 1 (
-    pause
+    %PAUSE_CMD%
     exit /b 1
 )
 
 if "%DO_LAUNCH%"=="0" exit /b 0
 
-for /f "delims=" %%W in ('%PY% -c "import sys, pathlib; p=pathlib.Path(sys.executable); w=p.with_name('pythonw.exe'); print(w if w.is_file() else p)"') do set "PYW=%%W"
+REM MinGit installe par setup_france.py : F95Checker en a besoin aussi (bouton Verifier, watermark)
+if exist "%RUNTIME%\mingit\cmd\git.exe" set "PATH=%RUNTIME%\mingit\cmd;%PATH%"
+REM "call" : sinon for /f retire les guillemets d'un chemin Python contenant des espaces
+for /f "delims=" %%W in ('call %PY% -c "import sys, pathlib; p=pathlib.Path(sys.executable); w=p.with_name('pythonw.exe'); print(w if w.is_file() else p)"') do set "PYW=%%W"
 if not exist "%SRCDIR%\main.py" (
-    echo F95Checker-src manquant. Relancez le .bat avec Internet/Git.
-    pause
+    echo F95Checker-src manquant. Relancez le .bat avec Internet.
+    %PAUSE_CMD%
     exit /b 1
 )
 %PY% -m py_compile "%SRCDIR%\modules\gui.py" 2>nul
 if errorlevel 1 (
     echo gui.py invalide. Relancez le .bat pour reparer le patch.
-    pause
+    %PAUSE_CMD%
     exit /b 1
 )
 echo.
@@ -73,6 +88,14 @@ echo F95Checker demarre (fenetre separee, sans console).
 echo.
 REM Fermer cette console si le .bat a ete ouvert par double-clic
 echo %CMDCMDLINE% | findstr /I /C:"/c" >nul && exit
+exit /b 0
+
+:install_python
+REM Python prive au launcher, installe pour l'utilisateur courant (sans droits admin)
+if defined UPDATE_PROMPT exit /b 0
+echo Installation de Python 3.12, une seule fois, patientez...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [IO.Directory]::CreateDirectory($env:RUNTIME)|Out-Null; $dest=Join-Path $env:RUNTIME 'python-installer.exe'; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' -OutFile $dest -UseBasicParsing -TimeoutSec 300; if((Get-FileHash -Algorithm SHA256 $dest).Hash -ne '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb'){ Remove-Item $dest; throw 'Empreinte de l''installateur Python invalide' }; $opts='/quiet InstallAllUsers=0 Include_launcher=0 Include_test=0 Include_doc=0 Include_tcltk=0 Shortcuts=0 AssociateFiles=0 PrependPath=0 TargetDir='+[char]34+$env:PRIVATE_PY_DIR+[char]34; $proc=Start-Process -FilePath $dest -ArgumentList $opts -Wait -PassThru; Remove-Item $dest -ErrorAction SilentlyContinue; if($proc.ExitCode -ne 0){ throw ('Installateur Python : code '+$proc.ExitCode) } }"
+if exist "%PRIVATE_PY%" set PY="%PRIVATE_PY%"
 exit /b 0
 
 :extract_embedded
@@ -118,11 +141,16 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import ctypes
+import hashlib
 import json
+import os
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +160,9 @@ SRC = ROOT / "F95Checker-src"
 INI = CACHE_DIR / "france_labels.ini"
 REPO = "https://github.com/WillyJL/F95Checker.git"
 BROKEN_MARKER = CACHE_DIR / "broken_commit.txt"
+MINGIT_URL = "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/MinGit-2.56.0.4-64-bit.zip"
+MINGIT_SHA256 = "e3bf78351fe777fba47ddee5950082f8a98bb0f02604fdc7ba3ee2cb68ffa877"
+MINGIT_DIR = CACHE_DIR / "mingit"
 # Wheels Windows compilees par .github/workflows/windows-wheels.yml
 WHEELS_RELEASE_API = "https://api.github.com/repos/Hunteraulo1/f95list-f95checker/releases/tags/windows-wheels"
 PATCHED_FILES_TO_VERIFY = (
@@ -215,6 +246,52 @@ def find_python() -> list[str]:
     return []
 
 
+def use_bundled_certificates() -> None:
+    """Windows recent : les certificats racines ne sont mis en cache qu'a la demande, Python
+    les trouve donc absents (CERTIFICATE_VERIFY_FAILED). On utilise ceux fournis avec pip."""
+    try:
+        from pip._vendor import certifi
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return
+    urllib.request.install_opener(urllib.request.build_opener(urllib.request.HTTPSHandler(context=context)))
+
+
+def _download_mingit() -> None:
+    archive = CACHE_DIR / "mingit.zip"
+    extracted = CACHE_DIR / "mingit.tmp"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(extracted, ignore_errors=True)
+    urllib.request.urlretrieve(MINGIT_URL, archive)
+    try:
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != MINGIT_SHA256:
+            raise ValueError("empreinte de l'archive invalide")
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(extracted)
+        extracted.rename(MINGIT_DIR)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+def ensure_git() -> None:
+    """Windows sans Git : installe MinGit dans le cache, sans droits admin ni PATH systeme."""
+    if sys.platform != "win32" or shutil.which("git"):
+        return
+    git_dir = MINGIT_DIR / "cmd"
+    if not (git_dir / "git.exe").is_file():
+        if os.environ.get("UPDATE_PROMPT"):
+            return  # Demarrage avec Windows : pas d'installation sans fenetre visible
+        print("Installation de Git (une seule fois, patientez)...")
+        try:
+            _download_mingit()
+        except Exception as exc:
+            msg = f"Installation de Git impossible ({exc}).\nLes mises a jour de F95Checker sont indisponibles."
+            print(msg)
+            ctypes.windll.user32.MessageBoxW(0, msg, "F95Checker France", 0x40030)
+            return
+    os.environ["PATH"] = f"{git_dir}{os.pathsep}{os.environ['PATH']}"
+
+
 def ensure_src() -> None:
     if (SRC / "main.py").is_file():
         return
@@ -223,8 +300,8 @@ def ensure_src() -> None:
         subprocess.run(["git", "clone", "--depth", "1", REPO, str(SRC)], check=True, cwd=ROOT)
         return
     raise SystemExit(
-        "F95Checker-src introuvable et Git non installe.\n"
-        "Installez Git : https://git-scm.com/download/win"
+        "F95Checker-src introuvable et Git indisponible.\n"
+        "Verifiez votre connexion puis relancez."
     )
 
 
@@ -269,7 +346,8 @@ def auto_update_upstream() -> None:
             ["git", "rev-parse", "origin/main"],
             check=True, cwd=SRC, capture_output=True, text=True,
         ).stdout.strip()
-    except Exception:
+    except Exception as exc:
+        print(f"Mise a jour de F95Checker non verifiee ({exc}).")
         return  # Pas de connexion ou souci git : on continue avec la version actuelle
 
     if local == remote:
@@ -1156,13 +1234,14 @@ def main() -> int:
     if not py_cmd:
         print("Python 3.12 (ou 3.11) requis.")
         return 1
+    use_bundled_certificates()
+    ensure_git()
     ensure_src()
     auto_update_upstream()
     apply_patches()
-    ensure_config(force=args.reconfigure)
-    if args.setup_only or args.reconfigure:
-        return 0
+    # Avant ensure_config : la verification de la cle API importe les modules de F95Checker
     ensure_deps(py_cmd)
+    ensure_config(force=args.reconfigure)
     return 0
 
 
@@ -1177,13 +1256,17 @@ from __future__ import annotations
 import asyncio
 import configparser
 import json
+import os
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import certifi
 
 from common.structs import Label
 
@@ -1201,6 +1284,9 @@ _HTTP_HEADERS = {
     ),
     "Accept": "application/json",
 }
+
+# Windows recent : racines absentes du magasin tant qu'elles n'ont pas servi (voir setup_france.py)
+_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 _busy = False
 _last_result = ""
@@ -1287,7 +1373,7 @@ def fetch_france_catalog(
     auth_mode = cfg["france"].get("auth_mode", auth_mode)
     req = urllib.request.Request(url, headers=_request_headers(api_key, auth_mode))
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=_SSL_CONTEXT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise ValueError(_api_error_message(exc.code, exc.read())) from exc
@@ -1475,7 +1561,7 @@ def _check_launcher(root: Path) -> tuple[bool, str]:
     """Compare le .bat local au .bat publie sur GitHub."""
     req = urllib.request.Request(LAUNCHER_RAW_URL, headers=_HTTP_HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:
             remote = resp.read()
         local = (root / "F95Checker-France.bat").read_bytes()
     except OSError as exc:
@@ -1525,10 +1611,47 @@ def _check_updates() -> tuple[bool, bool, list[str]]:
     return available, failed, lines
 
 
+def _spawn_launcher_after_exit(root: Path) -> None:
+    """Relance le launcher une fois ce processus termine : tant que F95Checker tourne, le
+    verrou d'instance unique ferait quitter la nouvelle instance aussitot."""
+    env = dict(os.environ, F95_RESTART_PID=str(os.getpid()))
+    # Herite d'un demarrage avec Windows : le launcher se croirait encore en mode silencieux
+    env.pop("UPDATE_PROMPT", None)
+    if sys.platform == "win32":
+        env["F95_RESTART_LAUNCHER"] = str(root / "F95Checker-France.bat")
+        script = "Wait-Process -Id $env:F95_RESTART_PID -ErrorAction SilentlyContinue; Start-Process -FilePath $env:F95_RESTART_LAUNCHER"
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+    else:
+        env["F95_RESTART_LAUNCHER"] = str(root / "F95Checker-France.sh")
+        script = 'tail --pid="$F95_RESTART_PID" -f /dev/null; exec bash "$F95_RESTART_LAUNCHER"'
+        cmd = ["bash", "-c", script]
+    subprocess.Popen(
+        cmd, env=env, cwd=root,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        start_new_session=sys.platform != "win32",
+    )
+
+
+def _install_updates() -> None:
+    from common.structs import MsgBox
+    from external import error
+    from modules import globals, msgbox, utils
+
+    try:
+        _spawn_launcher_after_exit(Path(__file__).resolve().parents[2])
+    except Exception:
+        utils.push_popup(
+            msgbox.msgbox, "F95-France", error.text(), MsgBox.error, more=error.traceback()
+        )
+        return
+    globals.gui.close()
+
+
 async def check_updates_from_gui() -> None:
     from common.structs import MsgBox
     from external import error
-    from modules import msgbox, utils
+    from modules import icons, msgbox, utils
     global _checking_updates, _last_update_result
     if _checking_updates:
         return
@@ -1539,12 +1662,18 @@ async def check_updates_from_gui() -> None:
         available, failed, lines = await loop.run_in_executor(None, _check_updates)
         if available:
             _last_update_result = "Mise a jour disponible"
-            lines.append("\nFermez F95Checker puis relancez F95Checker-France pour l'installer.")
+            lines.append("\nF95Checker va se fermer, se mettre a jour puis redemarrer.")
+            buttons = {
+                f"{icons.check} Mettre a jour": _install_updates,
+                f"{icons.cancel} Plus tard": None,
+            }
         else:
             _last_update_result = "Verification incomplete" if failed else "Tout est a jour"
+            buttons = True
         utils.push_popup(
             msgbox.msgbox, "F95-France", "\n".join(lines),
             MsgBox.warn if failed else MsgBox.info,
+            buttons,
         )
     except Exception:
         _last_update_result = "Erreur"
@@ -1634,6 +1763,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 LC_HOST_MARKER = "lewdcorner.com"
@@ -1651,6 +1781,7 @@ _lc_sem = None
 # Erreur bloquante (403/429/5xx) rencontree pendant le refresh en cours : les jeux
 # restants ne sont plus demandes, pour ne pas insister sur un site qui refuse
 _lc_abort_error: str | None = None
+LC_LOGIN_SNOOZE = 24 * 60 * 60
 _LC_URL_RE = re.compile(r"\S*lewdcorner\.com/threads/(?:[^./\s]*\.)?\d+\S*", re.IGNORECASE)
 
 
@@ -1678,6 +1809,24 @@ def _save_lc_cookies(cookies: dict[str, str]) -> None:
     path = _cookies_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cookies), encoding="utf-8")
+
+
+def _login_dismissed_path() -> Path:
+    return _cookies_path().with_name("lc_login_dismissed.txt")
+
+
+def _is_login_snoozed() -> bool:
+    """L'utilisateur a ferme la fenetre de connexion automatique il y a moins de LC_LOGIN_SNOOZE."""
+    try:
+        return time.time() - float(_login_dismissed_path().read_text(encoding="utf-8")) < LC_LOGIN_SNOOZE
+    except (OSError, ValueError):
+        return False
+
+
+def _snooze_login() -> None:
+    path = _login_dismissed_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(time.time()), encoding="utf-8")
 
 
 def is_lc_logged_in() -> bool:
@@ -1709,9 +1858,11 @@ async def lc_login() -> bool:
                     break
     except Exception:
         return False
-    if not new_cookies:
+    # Fenetre fermee sans connexion : garder la session actuelle plutot que l'ecraser
+    if "xf_user" not in new_cookies:
         return False
     _save_lc_cookies(new_cookies)
+    _login_dismissed_path().unlink(missing_ok=True)
     return True
 
 
@@ -2158,8 +2309,12 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
     _lc_sem = asyncio.Semaphore(_LC_MAX_CONCURRENT)
     _lc_abort_error = None
     ok, err = await check_lc_session()
-    if err == "LOGIN_REQUIRED" and await lc_login():
-        ok, err = await check_lc_session()
+    # F95Checker en arriere-plan : pas de fenetre de connexion surprise, comme le captcha d'api.py
+    if err == "LOGIN_REQUIRED" and not globals.gui.hidden and not _is_login_snoozed():
+        if await lc_login():
+            ok, err = await check_lc_session()
+        else:
+            _snooze_login()
     if not ok and err and ("HTTP 403" in err or err in ("REQUIRED_READING", "LOGIN_REQUIRED")):
         _session_expired_games.extend(game.name for game in games)
         globals.refresh_progress += len(games)
@@ -2176,7 +2331,11 @@ def report_session_expired() -> None:
     """Affiche une seule popup pour tous les jeux LC refuses en 403 pendant ce refresh,
     et une par type d'erreur pour les autres echecs."""
     from common.structs import MsgBox
-    from modules import msgbox, utils
+    from modules import globals, msgbox, utils
+
+    if globals.gui.hidden:
+        # Sinon une popup s'empilerait a chaque refresh ; le prochain refresh visible redemandera
+        _session_expired_games.clear()
 
     for error_msg, failed in _failed_games.items():
         names = sorted(set(failed))
