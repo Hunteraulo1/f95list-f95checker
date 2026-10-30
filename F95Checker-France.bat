@@ -145,6 +145,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -668,6 +669,14 @@ STRUCTS_PREVIEW_NEW = """                    if "lewdcorner.com" in url:
                     else:
                         data, _ = await api.download_image(url)"""
 
+# Le sous-processus webview ne connait que les fonctions de webview.py
+WEBVIEW_LC_BROWSER = """
+
+def lc_browser(**kwargs):
+    from modules import lc_games
+    lc_games.browser_daemon(**kwargs)
+"""
+
 CALLBACKS_FUZZY_OLD = """def _fuzzy_match_subdir(where: pathlib.Path, match: str, best_partial_match: bool):
     clean_dir = utils.clean_str(match)
     if (where / clean_dir).is_dir():
@@ -819,7 +828,7 @@ API_LC_TASKS_OLD = """        await asyncio.gather(*tasks)
 
 # @UPDATES@ : dict local "updates" des versions upstream recentes, sinon None
 # (lc_games retombe alors sur l'ancien globals.new_updated_games)
-API_LC_TASKS_NEW = """        tasks += await lc_games.start_refresh(lc_queue, @UPDATES@)
+API_LC_TASKS_NEW = """        tasks += await lc_games.start_refresh(lc_queue, @UPDATES@, full=full, selection=bool(games))
         await asyncio.gather(*tasks)
 """
 
@@ -1006,9 +1015,21 @@ def apply_lc_patches() -> None:
         print("Progression LewdCorner affichee en bas de fenetre (gui.py).")
 
     api_module = SRC / "modules" / "api.py"
-    api_text = api_module.read_text(encoding="utf-8")
+    api_original = api_module.read_text(encoding="utf-8")
+    api_text = api_original
     if "lc_games" not in api_text:
-        api_module.write_text(_patch_api_refresh(api_text), encoding="utf-8")
+        api_text = _patch_api_refresh(api_text)
+    elif "selection=bool(games)" not in api_text:
+        # Installations patchees avant le suivi des dernieres mises a jour
+        api_text, count = re.subn(
+            r"lc_games\.start_refresh\(lc_queue, (\w+)\)",
+            r"lc_games.start_refresh(lc_queue, \1, full=full, selection=bool(games))",
+            api_text,
+        )
+        if count != 1:
+            raise SystemExit("api.py a change : patch suivi des mises a jour LewdCorner impossible.")
+    if api_text != api_original:
+        api_module.write_text(api_text, encoding="utf-8")
         import py_compile
         py_compile.compile(str(api_module), doraise=True)
         print("Suivi des mises a jour LewdCorner branche sur refresh() (api.py).")
@@ -1033,6 +1054,12 @@ def apply_lc_patches() -> None:
                 raise SystemExit(f"{daemon_module.name} a change : patch sous-processus impossible.")
             daemon_module.write_text(daemon_text.replace(DAEMON_SPAWN_OLD, DAEMON_SPAWN_NEW, 1), encoding="utf-8")
             print(f"Sous-processus lances sans le .bat ({daemon_module.name}).")
+
+    webview_module = SRC / "modules" / "webview.py"
+    webview_text = webview_module.read_text(encoding="utf-8")
+    if "def lc_browser" not in webview_text:
+        webview_module.write_text(webview_text.rstrip("\n") + "\n" + WEBVIEW_LC_BROWSER, encoding="utf-8")
+        print("Navigateur LewdCorner en arriere-plan ajoute (webview.py).")
 
     callbacks_module = SRC / "modules" / "callbacks.py"
     callbacks_text = callbacks_module.read_text(encoding="utf-8")
@@ -1806,6 +1833,27 @@ _lc_remaining = 0
 _session_expired_reason = ""
 _status_login = False
 _status_session = False
+_status_challenge = False
+# Cloudflare refuse aiohttp sur certains systemes (defi 403 meme avec des cookies valides) :
+# des le premier refus, les requetes LC passent par un WebEngine masque jusqu'a la fermeture
+_browser_mode = False
+_browser_pipe = None
+_browser_lock = None
+_browser_seq = 0
+_BROWSER_BASE_URL = f"https://{LC_HOST_MARKER}/robots.txt"
+_BROWSER_HOSTS = (LC_HOST_MARKER, f"www.{LC_HOST_MARKER}")
+_BROWSER_LINE_LIMIT = 64 * 1024 * 1024
+_BROWSER_TIMEOUT = 40
+_BROWSER_CHALLENGE_TIMEOUT = 5 * 60
+_BROWSER_IDLE_MS = 2 * 60 * 1000
+# Liste des dernieres mises a jour (page Latest Updates V2) : evite une requete par jeu a
+# chaque refresh : LewdCorner est strict, seul un Full Refresh manuel demande toutes les pages.
+# La marge couvre aussi son tri, pas strictement chronologique.
+_LC_UPDATES_URL = f"https://{LC_HOST_MARKER}/latest-updatesv2/api?view=all&sort=date&cat=All&tier=All&per_page=60&page="
+_LC_UPDATES_MAX_PAGES = 20
+_LC_FIRST_LOOKBACK = 30 * 24 * 60 * 60
+_LC_FEED_MARGIN = 60 * 60
+_feed_state_pending: dict | None = None
 _LC_URL_RE = re.compile(r"\S*lewdcorner\.com/threads/(?:[^./\s]*\.)?\d+\S*", re.IGNORECASE)
 
 
@@ -1887,6 +1935,7 @@ async def lc_login() -> bool:
         return False
     _save_lc_cookies(new_cookies)
     _login_dismissed_path().unlink(missing_ok=True)
+    _close_browser()
     return True
 
 
@@ -1941,22 +1990,349 @@ async def _fetch_page(url: str) -> tuple[bytes | None, str | None]:
     du HTML brut. N'attache les cookies de session LewdCorner que si l'URL
     cible est bien lewdcorner.com, pour ne jamais les envoyer a un hote tiers.
     """
+    global _browser_mode
     from modules import api
 
+    if _browser_mode and _browser_can_fetch(url):
+        return await _fetch_page_browser(url)
     cookies = _load_lc_cookies() if is_lc_url(url) else False
     try:
         async with api.request("GET", url, cookies=cookies, timeout=30, headers=_LC_BROWSER_HEADERS) as (res, req):
+            if _is_cf_challenge(req.status, req.headers.get("cf-mitigated")) and _browser_can_fetch(url):
+                _browser_mode = True
+                return await _fetch_page_browser(url)
             if req.status >= 400:
-                if req.status == 403 and b"required reading" in res.lower():
-                    # LewdCorner bloque tout le site (meme la home) tant qu'un sujet marque
-                    # "lecture obligatoire" par le staff n'a pas ete ouvert une fois par ce
-                    # compte, dans un vrai navigateur. Le compte est bien connecte : ca n'a
-                    # rien a voir avec Cloudflare ni avec des cookies perimes.
-                    return None, "REQUIRED_READING"
-                return None, f"HTTP {req.status}"
+                return None, _http_error(req.status, res)
             return res, None
     except Exception as exc:
         return None, (f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+
+
+def _http_error(status: int, body: bytes) -> str:
+    if status == 403 and b"required reading" in body.lower():
+        # LewdCorner bloque tout le site (meme la home) tant qu'un sujet marque
+        # "lecture obligatoire" par le staff n'a pas ete ouvert une fois par ce
+        # compte, dans un vrai navigateur. Le compte est bien connecte : ca n'a
+        # rien a voir avec Cloudflare ni avec des cookies perimes.
+        return "REQUIRED_READING"
+    return f"HTTP {status}"
+
+
+def _is_cf_challenge(status: int, mitigated: str | None) -> bool:
+    return status == 403 and mitigated == "challenge"
+
+
+def _browser_can_fetch(url: str) -> bool:
+    """Le fetch() du navigateur masque ne peut lire que sa propre origine."""
+    from urllib.parse import urlsplit
+
+    return (urlsplit(url).hostname or "").lower() in _BROWSER_HOSTS
+
+
+def _close_browser() -> None:
+    global _browser_pipe
+    if _browser_pipe:
+        _browser_pipe.kill()
+        _browser_pipe = None
+
+
+def _remember_browser_cookie(name: str, value: str) -> None:
+    cookies = _load_lc_cookies()
+    if cookies.get(name) != value:
+        cookies[name] = value
+        _save_lc_cookies(cookies)
+
+
+async def _start_browser():
+    import asyncio
+    import shlex
+    from common.structs import DaemonPipe
+    from modules import globals, webview
+
+    kwargs = webview.create_kwargs() | dict(
+        title="F95Checker: Verification LewdCorner",
+        size=(500, 720),
+        buttons=False,
+        extension=False,
+        private=True,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *shlex.split(globals.daemon_cmd or globals.start_cmd),
+        "webview-daemon",
+        json.dumps(["lc_browser"]),
+        json.dumps(kwargs),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        # Une ligne contient une page entiere (64 Ko par defaut)
+        limit=_BROWSER_LINE_LIMIT,
+    )
+    pipe = DaemonPipe(proc)
+    # Par le pipe et non en argument : la ligne de commande est visible des autres processus
+    pipe.put({"cookies": _load_lc_cookies()})
+    return pipe
+
+
+async def _browser_exchange(request: dict) -> dict:
+    import asyncio
+
+    global _browser_pipe, _status_challenge
+    if not _browser_pipe or not await _browser_pipe.is_alive():
+        _browser_pipe = await _start_browser()
+    _browser_pipe.put(request)
+    timeout = _BROWSER_TIMEOUT
+    try:
+        while True:
+            message = await asyncio.wait_for(_browser_pipe.get_async(), timeout)
+            if not isinstance(message, dict):
+                continue
+            if "cookie" in message:
+                _remember_browser_cookie(*message["cookie"])
+            elif "challenge" in message:
+                _status_challenge = True
+                timeout = _BROWSER_CHALLENGE_TIMEOUT + _BROWSER_TIMEOUT
+            elif message.get("id") == request["id"]:
+                return message
+    finally:
+        _status_challenge = False
+
+
+async def _browser_fetch(url: str, follow_redirects: bool = True) -> dict:
+    """Requete via le WebEngine masque. Renvoie la reponse du sous-processus, ou {"error": ...}."""
+    import asyncio
+    import base64
+    from common.structs import DaemonPipe
+    from modules import globals
+
+    global _browser_lock, _browser_seq
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+    async with _browser_lock:
+        _browser_seq += 1
+        request = {
+            "id": _browser_seq,
+            "url": url,
+            "follow": follow_redirects,
+            # F95Checker en arriere-plan : pas de fenetre surprise, comme lc_login
+            "interactive": not globals.gui.hidden,
+        }
+        # Le sous-processus peut avoir quitte pour inactivite juste avant cette requete
+        for attempt in range(2):
+            try:
+                result = await _browser_exchange(request)
+                break
+            except DaemonPipe.DaemonPipeExit:
+                _close_browser()
+                if attempt:
+                    return {"error": "navigateur LewdCorner arrete de facon inattendue"}
+            except Exception as exc:
+                _close_browser()
+                return {"error": f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__}
+    if result.get("error"):
+        return result
+    return result | {"body": base64.b64decode(result.get("body") or "")}
+
+
+async def _fetch_page_browser(url: str) -> tuple[bytes | None, str | None]:
+    result = await _browser_fetch(url)
+    if err := result.get("error"):
+        return None, err
+    if _is_cf_challenge(result["status"], result.get("mitigated")):
+        return None, "CLOUDFLARE_CHALLENGE"
+    if result["status"] >= 400:
+        return None, _http_error(result["status"], result["body"])
+    return result["body"], None
+
+
+def browser_daemon(**kwargs) -> None:
+    """Sous-processus : garde une page LewdCorner legere ouverte et y execute les requetes
+    avec fetch(), donc avec le reseau et les cookies du navigateur, sans charger les scripts
+    et images de chaque page. La fenetre reste masquee tant que Cloudflare ne demande rien."""
+    import sys
+    import threading
+
+    from PyQt6 import QtCore, QtNetwork
+    from modules import webview
+
+    app = webview.create(**kwargs)
+    app.setQuitOnLastWindowClosed(False)
+    window = app.window
+    view = window.webview
+    pipe = app.pipe
+    base_url = QtCore.QUrl(_BROWSER_BASE_URL)
+    home_url = QtCore.QUrl(f"https://{LC_HOST_MARKER}/")
+    state = "loading"
+    request = None
+    fetching = False
+    challenge_announced = False
+
+    def reply(**fields):
+        nonlocal request, fetching, challenge_announced
+        pipe.put({"id": request["id"], **fields})
+        request = None
+        fetching = False
+        challenge_announced = False
+        result_timer.stop()
+        challenge_deadline.stop()
+        window.hide()
+        idle_timer.start()
+
+    def reply_challenge():
+        reply(status=403, mitigated="challenge", body="")
+
+    def navigate(url):
+        nonlocal state
+        state = "loading"
+        view.setUrl(url)
+
+    def detect_page(_=None):
+        view.page.runJavaScript("!!(window._cf_chl_opt || document.getElementById('challenge-form'))", 0, on_detected)
+
+    def on_detected(is_challenge):
+        nonlocal state, challenge_announced
+        if state == "ready":
+            return
+        if is_challenge:
+            state = "challenge"
+            if not request:
+                return
+            if not request["interactive"]:
+                reply_challenge()
+                return
+            if not challenge_announced:
+                challenge_announced = True
+                pipe.put({"challenge": True})
+                challenge_deadline.start()
+                window.show()
+                window.raise_()
+                window.activateWindow()
+            challenge_poll.start()
+            return
+        challenge_poll.stop()
+        if view.url().path() != base_url.path():
+            navigate(base_url)
+            return
+        state = "ready"
+        window.hide()
+        start_fetch()
+
+    def start_fetch():
+        nonlocal fetching
+        if state != "ready" or not request or fetching:
+            return
+        fetching = True
+        idle_timer.stop()
+        redirect = "follow" if request["follow"] else "manual"
+        view.page.runJavaScript(f"""
+            window.__lc = window.__lc || {{}};
+            delete window.__lc[{request["id"]}];
+            fetch({json.dumps(request["url"])}, {{
+                credentials: "include",
+                redirect: "{redirect}",
+                signal: AbortSignal.timeout({_BROWSER_TIMEOUT * 1000 - 5000}),
+            }}).then(async res => {{
+                const bytes = new Uint8Array(await res.arrayBuffer());
+                let binary = "";
+                for (let i = 0; i < bytes.length; i += 32768) {{
+                    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+                }}
+                window.__lc[{request["id"]}] = {{
+                    status: res.status,
+                    redirected: res.type === "opaqueredirect",
+                    url: res.url,
+                    mitigated: res.headers.get("cf-mitigated"),
+                    body: btoa(binary),
+                }};
+            }}).catch(err => {{
+                window.__lc[{request["id"]}] = {{ error: String(err) }};
+            }});
+        """, 1)
+        result_timer.start()
+
+    def poll_result():
+        if request:
+            view.page.runJavaScript(
+                f"window.__lc && window.__lc[{request['id']}] ? JSON.stringify(window.__lc[{request['id']}]) : null",
+                1, on_result,
+            )
+
+    def on_result(raw):
+        nonlocal fetching
+        if not raw or not fetching:
+            return
+        result_timer.stop()
+        result = json.loads(raw)
+        if _is_cf_challenge(result.get("status"), result.get("mitigated")) and request["interactive"] and not request.get("retried"):
+            # Ouvrir une vraie page, la seule a pouvoir afficher le defi, puis rejouer la requete
+            request["retried"] = True
+            fetching = False
+            navigate(home_url)
+            return
+        reply(**result)
+
+    def on_stdin_line(line: str):
+        nonlocal request
+        message = json.loads(line) if line else None
+        if message is None:
+            app.quit()
+        elif "cookies" in message:
+            origin = QtCore.QUrl(f"https://{LC_HOST_MARKER}")
+            for key, value in message["cookies"].items():
+                view.cookieStore.setCookie(
+                    QtNetwork.QNetworkCookie(QtCore.QByteArray(key.encode()), QtCore.QByteArray(value.encode())),
+                    origin,
+                )
+            view.setUrl(base_url)
+        else:
+            request = message
+            idle_timer.stop()
+            if state == "challenge":
+                detect_page()
+            else:
+                start_fetch()
+
+    def on_cookie_added(cookie: QtNetwork.QNetworkCookie):
+        if LC_HOST_MARKER in cookie.domain():
+            pipe.put({"cookie": [cookie.name().data().decode("utf-8"), cookie.value().data().decode("utf-8")]})
+
+    class StdinBridge(QtCore.QObject):
+        line = QtCore.pyqtSignal(str)
+
+    bridge = StdinBridge()
+    bridge.line.connect(on_stdin_line)
+
+    def read_stdin():
+        for line in sys.stdin:
+            bridge.line.emit(line)
+        # Application principale fermee
+        bridge.line.emit("")
+
+    def make_timer(interval: int, callback, single_shot=False):
+        timer = QtCore.QTimer(app)
+        timer.setInterval(interval)
+        timer.setSingleShot(single_shot)
+        timer.timeout.connect(callback)
+        return timer
+
+    result_timer = make_timer(50, poll_result)
+    challenge_poll = make_timer(1000, detect_page)
+    challenge_deadline = make_timer(_BROWSER_CHALLENGE_TIMEOUT * 1000, lambda: request and reply_challenge(), True)
+    idle_timer = make_timer(_BROWSER_IDLE_MS, app.quit, True)
+
+    original_close = window.closeEvent
+
+    def close_event(event):
+        # Fenetre fermee sans repondre au defi
+        if request:
+            reply_challenge()
+        original_close(event)
+        app.quit()
+
+    window.closeEvent = close_event
+    view.cookieStore.cookieAdded.connect(on_cookie_added)
+    view.loadFinished.connect(detect_page)
+    idle_timer.start()
+    threading.Thread(target=read_stdin, daemon=True).start()
+    app.exec()
 
 
 _LC_ALIAS_TAGS = {
@@ -2256,10 +2632,13 @@ async def check_lc_session() -> tuple[bool, str | None]:
     par jeu. Une session/cookie 'cf_clearance' perime bloque TOUTES les requetes de la
     meme facon (pas juste certains jeux), donc un seul aller-retour ici evite d'envoyer
     N requetes vouees a echouer identiquement en 403. Renvoie (ok, erreur)."""
+    global _browser_mode
     from modules import api
 
     if not is_lc_logged_in():
         return False, "LOGIN_REQUIRED"
+    if _browser_mode:
+        return await _check_lc_session_browser()
     try:
         # Sans suivre les redirections : avec des cookies expires, LewdCorner boucle
         # indefiniment vers /login/two-step au lieu de renvoyer une erreur
@@ -2267,19 +2646,36 @@ async def check_lc_session() -> tuple[bool, str | None]:
             "GET", f"https://{LC_HOST_MARKER}/", cookies=_load_lc_cookies(), timeout=30,
             headers=_LC_BROWSER_HEADERS, allow_redirects=False,
         ) as (res, req):
+            if _is_cf_challenge(req.status, req.headers.get("cf-mitigated")):
+                _browser_mode = True
+                return await _check_lc_session_browser()
             if 300 <= req.status < 400:
                 if "/login" in req.headers.get("Location", ""):
                     return False, "LOGIN_REQUIRED"
                 return False, f"HTTP {req.status}"
             if req.status >= 400:
-                if req.status == 403 and b"required reading" in res.lower():
-                    return False, "REQUIRED_READING"
-                return False, f"HTTP {req.status}"
+                return False, _http_error(req.status, res)
             if b'data-logged-in="true"' not in res:
                 return False, "LOGIN_REQUIRED"
             return True, None
     except Exception as exc:
         return False, (f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+
+
+async def _check_lc_session_browser() -> tuple[bool, str | None]:
+    result = await _browser_fetch(f"https://{LC_HOST_MARKER}/", follow_redirects=False)
+    if err := result.get("error"):
+        return False, err
+    # fetch() masque la cible des redirections : sur la home, c'est toujours /login
+    if result.get("redirected"):
+        return False, "LOGIN_REQUIRED"
+    if _is_cf_challenge(result["status"], result.get("mitigated")):
+        return False, "CLOUDFLARE_CHALLENGE"
+    if result["status"] >= 400:
+        return False, _http_error(result["status"], result["body"])
+    if b'data-logged-in="true"' not in result["body"]:
+        return False, "LOGIN_REQUIRED"
+    return True, None
 
 
 def status_text() -> str:
@@ -2288,6 +2684,8 @@ def status_text() -> str:
 
     if _status_login:
         return "En attente de la connexion LewdCorner..."
+    if _status_challenge:
+        return "En attente de la verification Cloudflare..."
     if _status_session:
         return "Verification de la session LewdCorner..."
     # is_refreshing : un refresh annule peut laisser des taches jamais demarrees dans le compte
@@ -2301,7 +2699,76 @@ def _session_failure_text(reason: str) -> str:
         return "LewdCorner ne reconnait pas la session."
     if reason == "REQUIRED_READING":
         return "Un sujet en lecture obligatoire doit etre ouvert sur LewdCorner dans un navigateur."
+    if "CLOUDFLARE_CHALLENGE" in reason:
+        return "La verification Cloudflare n'a pas ete terminee."
     return reason
+
+
+def _feed_state_path() -> Path:
+    return _cookies_path().with_name("lc_feed.json")
+
+
+def _load_feed_state() -> dict:
+    try:
+        data = json.loads(_feed_state_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _parse_updates_page(data: bytes) -> tuple[dict[int, float], bool] | None:
+    """Renvoie ({id du sujet: date de mise a jour}, autre page disponible), ou None si illisible."""
+    try:
+        result = json.loads(data)["result"]
+        return {int(item["id"]): float(item["timestamp"]) for item in result["items"]}, bool(result["hasMore"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def _fetch_recent_updates(since: float) -> dict[int, float] | None:
+    """Parcourt les mises a jour jusqu'a la date demandee, sans depasser le plafond de pages
+    (plus de 1000 mises a jour, soit des semaines d'absence). None si la liste est illisible."""
+    import asyncio
+
+    updates = {}
+    for page in range(1, _LC_UPDATES_MAX_PAGES + 1):
+        data, _ = await _fetch_page(f"{_LC_UPDATES_URL}{page}")
+        parsed = _parse_updates_page(data) if data else None
+        if not parsed or not parsed[0]:
+            return None
+        items, has_more = parsed
+        updates.update(items)
+        if not has_more or min(items.values()) < since:
+            return updates
+        await asyncio.sleep(_LC_REQUEST_DELAY)
+    return updates
+
+
+async def _games_to_refresh(games: list, full: bool, selection: bool) -> list:
+    """Ne garde que les jeux signales par la liste des mises a jour, sauf Full Refresh manuel."""
+    from common.structs import Status
+
+    global _feed_state_pending
+    _feed_state_pending = None
+    # Recheck de jeux choisis : ne dit rien sur les autres jeux, l'etat de suivi reste inchange
+    if selection:
+        return games
+    now = time.time()
+    if full:
+        _feed_state_pending = {"last_check": now}
+        return games
+    last_check = _load_feed_state().get("last_check", now - _LC_FIRST_LOOKBACK)
+    since = last_check - _LC_FEED_MARGIN
+    updates = await _fetch_recent_updates(since)
+    if updates is None:
+        # Jamais de repli sur toutes les pages : le prochain refresh reprendra depuis last_check
+        _failed_games.setdefault("Liste des mises a jour LewdCorner indisponible.", []).extend(game.name for game in games)
+        return []
+    _feed_state_pending = {"last_check": now}
+    return [
+        game for game in games
+        if game.status is Status.Unchecked or game.image.missing or updates.get(_thread_id(game.url), 0) >= since
+    ]
 
 
 async def refresh_lc_game(game, updates: dict | None = None) -> None:
@@ -2318,11 +2785,11 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
                 success, error_msg = False, _lc_abort_error
             else:
                 success, error_msg = await _scrape_and_apply(game, updates)
-                if not success and re.search(r"HTTP (403|429|5\d\d)|REQUIRED_READING|TooManyRedirects", error_msg):
+                if not success and re.search(r"HTTP (403|429|5\d\d)|REQUIRED_READING|CLOUDFLARE_CHALLENGE|TooManyRedirects", error_msg):
                     _lc_abort_error = error_msg
                 await asyncio.sleep(_LC_REQUEST_DELAY)
         if not success:
-            if "HTTP 403" in error_msg or "TooManyRedirects" in error_msg or error_msg == "REQUIRED_READING":
+            if "HTTP 403" in error_msg or "TooManyRedirects" in error_msg or "CLOUDFLARE_CHALLENGE" in error_msg or error_msg == "REQUIRED_READING":
                 # Le 403 sur LewdCorner vient quasi toujours d'une session/cookie
                 # Cloudflare (cf_clearance) perimee ou liee a une autre IP que celle
                 # de ce client HTTP, pas d'un vrai probleme par jeu. Regrouper ces
@@ -2345,13 +2812,14 @@ async def refresh_lc_game(game, updates: dict | None = None) -> None:
         globals.refresh_progress += 1
 
 
-async def start_refresh(games: list, updates: dict | None = None) -> list:
+async def start_refresh(games: list, updates: dict | None = None, *, full: bool = True, selection: bool = False) -> list:
     """Point d'entree appele depuis api.refresh() : verifie d'abord la session LC une
     seule fois, et ne lance les refresh par jeu (taches renvoyees) que si elle passe."""
     import asyncio
     from modules import globals
 
-    global _lc_sem, _lc_abort_error, _lc_remaining, _session_expired_reason, _status_login, _status_session
+    global _feed_state_pending, _lc_sem, _lc_abort_error, _lc_remaining, _session_expired_reason, _status_login, _status_session
+    _feed_state_pending = None
     if not games:
         return []
     _lc_sem = asyncio.Semaphore(_LC_MAX_CONCURRENT)
@@ -2373,7 +2841,7 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
                 _snooze_login()
     finally:
         _status_session = False
-    if not ok and err and ("HTTP 403" in err or err in ("REQUIRED_READING", "LOGIN_REQUIRED")):
+    if not ok and err and ("HTTP 403" in err or err in ("REQUIRED_READING", "LOGIN_REQUIRED", "CLOUDFLARE_CHALLENGE")):
         _session_expired_games.extend(game.name for game in games)
         _session_expired_reason = err
         globals.refresh_progress += len(games)
@@ -2383,8 +2851,14 @@ async def start_refresh(games: list, updates: dict | None = None) -> list:
         _failed_games.setdefault(f"LewdCorner injoignable ({err}).", []).extend(game.name for game in games)
         globals.refresh_progress += len(games)
         return []
-    _lc_remaining = len(games)
-    return [asyncio.create_task(refresh_lc_game(game, updates)) for game in games]
+    _status_session = True
+    try:
+        selected = await _games_to_refresh(games, full, selection)
+    finally:
+        _status_session = False
+    globals.refresh_progress += len(games) - len(selected)
+    _lc_remaining = len(selected)
+    return [asyncio.create_task(refresh_lc_game(game, updates)) for game in selected]
 
 
 def report_session_expired() -> None:
@@ -2392,6 +2866,15 @@ def report_session_expired() -> None:
     et une par type d'erreur pour les autres echecs."""
     from common.structs import MsgBox
     from modules import globals, msgbox, utils
+
+    global _feed_state_pending
+    # Refresh interrompu par le site : les jeux restants n'ont pas ete vus. Un echec isole
+    # (sujet supprime...) ne bloque pas : la liste ne le signalerait de toute facon plus.
+    if _feed_state_pending and not _session_expired_games and not _lc_abort_error:
+        path = _feed_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_feed_state_pending), encoding="utf-8")
+    _feed_state_pending = None
 
     if globals.gui.hidden:
         # Sinon une popup s'empilerait a chaque refresh ; le prochain refresh visible redemandera
@@ -2415,7 +2898,11 @@ def report_session_expired() -> None:
         msgbox.msgbox, "LewdCorner",
         f"{len(names)} jeu(x) LewdCorner non verifie(s) : session expiree ou refusee.\n"
         f"Cause : {_session_failure_text(_session_expired_reason)}\n"
-        "Reconnectez-vous via le bouton Se connecter dans la sidebar LewdCorner.",
+        + (
+            "Relancez la verification et terminez-la dans la fenetre qui s'ouvre."
+            if "CLOUDFLARE_CHALLENGE" in _session_expired_reason
+            else "Reconnectez-vous via le bouton Se connecter dans la sidebar LewdCorner."
+        ),
         MsgBox.warn,
         more="\n".join(names),
     )
