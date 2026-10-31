@@ -1845,6 +1845,8 @@ _BROWSER_HOSTS = (LC_HOST_MARKER, f"www.{LC_HOST_MARKER}")
 _BROWSER_LINE_LIMIT = 64 * 1024 * 1024
 _BROWSER_TIMEOUT = 40
 _BROWSER_CHALLENGE_TIMEOUT = 5 * 60
+_BROWSER_CHALLENGE_GRACE_MS = 20 * 1000
+_BROWSER_FOCUS_POLL = 0.5
 _BROWSER_IDLE_MS = 2 * 60 * 1000
 # Liste des dernieres mises a jour (page Latest Updates V2) : evite une requete par jeu a
 # chaque refresh : LewdCorner est strict, seul un Full Refresh manuel demande toutes les pages.
@@ -2072,6 +2074,13 @@ async def _start_browser():
     return pipe
 
 
+def _main_window_active() -> bool:
+    from modules import globals
+
+    gui = globals.gui
+    return bool(gui.focused) and not gui.hidden and not gui.minimized
+
+
 async def _browser_exchange(request: dict) -> dict:
     import asyncio
 
@@ -2080,19 +2089,36 @@ async def _browser_exchange(request: dict) -> dict:
         _browser_pipe = await _start_browser()
     _browser_pipe.put(request)
     timeout = _BROWSER_TIMEOUT
+    waiting_for_user = False
+    next_message = None
     try:
         while True:
-            message = await asyncio.wait_for(_browser_pipe.get_async(), timeout)
+            # Pas de wait_for pendant l'attente : l'annuler chaque seconde pourrait perdre une ligne
+            next_message = next_message or asyncio.ensure_future(_browser_pipe.get_async())
+            done, _ = await asyncio.wait({next_message}, timeout=_BROWSER_FOCUS_POLL if waiting_for_user else timeout)
+            if not done:
+                if not waiting_for_user:
+                    raise TimeoutError
+                if _main_window_active():
+                    waiting_for_user = False
+                    timeout = _BROWSER_CHALLENGE_TIMEOUT + _BROWSER_TIMEOUT
+                    _browser_pipe.put({"reveal": True})
+                continue
+            message = next_message.result()
+            next_message = None
             if not isinstance(message, dict):
                 continue
             if "cookie" in message:
                 _remember_browser_cookie(*message["cookie"])
             elif "challenge" in message:
-                _status_challenge = True
+                _status_challenge = message["challenge"]
                 timeout = _BROWSER_CHALLENGE_TIMEOUT + _BROWSER_TIMEOUT
+                waiting_for_user = message["challenge"] == "user"
             elif message.get("id") == request["id"]:
                 return message
     finally:
+        if next_message:
+            next_message.cancel()
         _status_challenge = False
 
 
@@ -2146,7 +2172,9 @@ async def _fetch_page_browser(url: str) -> tuple[bytes | None, str | None]:
 def browser_daemon(**kwargs) -> None:
     """Sous-processus : garde une page LewdCorner legere ouverte et y execute les requetes
     avec fetch(), donc avec le reseau et les cookies du navigateur, sans charger les scripts
-    et images de chaque page. La fenetre reste masquee tant que Cloudflare ne demande rien."""
+    et images de chaque page. Un defi Cloudflare est d'abord tente hors ecran (une page jamais
+    affichee est gelee par Chromium), et seul un defi qui demande une action apparait, quand
+    l'utilisateur revient sur F95Checker."""
     import sys
     import threading
 
@@ -2173,11 +2201,24 @@ def browser_daemon(**kwargs) -> None:
         challenge_announced = False
         result_timer.stop()
         challenge_deadline.stop()
+        challenge_grace.stop()
         window.hide()
         idle_timer.start()
 
     def reply_challenge():
         reply(status=403, mitigated="challenge", body="")
+
+    def show_offscreen():
+        window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        window.show()
+
+    def reveal_challenge():
+        challenge_deadline.start()
+        window.hide()
+        window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DontShowOnScreen, False)
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def navigate(url):
         nonlocal state
@@ -2200,11 +2241,12 @@ def browser_daemon(**kwargs) -> None:
                 return
             if not challenge_announced:
                 challenge_announced = True
-                pipe.put({"challenge": True})
-                challenge_deadline.start()
-                window.show()
-                window.raise_()
-                window.activateWindow()
+                pipe.put({"challenge": "auto"})
+                challenge_grace.start()
+                if not window.isVisible():
+                    # Defi charge pendant que la page etait gelee : le relancer une fois active
+                    show_offscreen()
+                    view.reload()
             challenge_poll.start()
             return
         challenge_poll.stop()
@@ -2212,6 +2254,7 @@ def browser_daemon(**kwargs) -> None:
             navigate(base_url)
             return
         state = "ready"
+        challenge_grace.stop()
         window.hide()
         start_fetch()
 
@@ -2265,6 +2308,7 @@ def browser_daemon(**kwargs) -> None:
             # Ouvrir une vraie page, la seule a pouvoir afficher le defi, puis rejouer la requete
             request["retried"] = True
             fetching = False
+            show_offscreen()
             navigate(home_url)
             return
         reply(**result)
@@ -2282,6 +2326,10 @@ def browser_daemon(**kwargs) -> None:
                     origin,
                 )
             view.setUrl(base_url)
+        elif "reveal" in message:
+            # Le defi a pu aboutir pendant que ce message arrivait
+            if request and state == "challenge":
+                reveal_challenge()
         else:
             request = message
             idle_timer.stop()
@@ -2316,6 +2364,7 @@ def browser_daemon(**kwargs) -> None:
     result_timer = make_timer(50, poll_result)
     challenge_poll = make_timer(1000, detect_page)
     challenge_deadline = make_timer(_BROWSER_CHALLENGE_TIMEOUT * 1000, lambda: request and reply_challenge(), True)
+    challenge_grace = make_timer(_BROWSER_CHALLENGE_GRACE_MS, lambda: pipe.put({"challenge": "user"}), True)
     idle_timer = make_timer(_BROWSER_IDLE_MS, app.quit, True)
 
     original_close = window.closeEvent
@@ -2684,8 +2733,10 @@ def status_text() -> str:
 
     if _status_login:
         return "En attente de la connexion LewdCorner..."
+    if _status_challenge == "user":
+        return "Verification Cloudflare a faire dans sa fenetre..."
     if _status_challenge:
-        return "En attente de la verification Cloudflare..."
+        return "Verification Cloudflare en cours..."
     if _status_session:
         return "Verification de la session LewdCorner..."
     # is_refreshing : un refresh annule peut laisser des taches jamais demarrees dans le compte
