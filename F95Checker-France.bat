@@ -2081,6 +2081,18 @@ def _main_window_active() -> bool:
     return bool(gui.focused) and not gui.hidden and not gui.minimized
 
 
+async def _wait_for_main_window() -> bool:
+    """Attend que l'utilisateur revienne sur F95Checker. False si l'application est masquee."""
+    import asyncio
+    from modules import globals
+
+    while not globals.gui.hidden:
+        if _main_window_active():
+            return True
+        await asyncio.sleep(_BROWSER_FOCUS_POLL)
+    return False
+
+
 async def _browser_exchange(request: dict) -> dict:
     import asyncio
 
@@ -2880,16 +2892,17 @@ async def start_refresh(games: list, updates: dict | None = None, *, full: bool 
     try:
         ok, err = await check_lc_session()
         # F95Checker en arriere-plan : pas de fenetre de connexion surprise, comme le captcha d'api.py
-        if err == "LOGIN_REQUIRED" and not globals.gui.hidden and not _is_login_snoozed():
+        if err == "LOGIN_REQUIRED" and not _is_login_snoozed():
             _status_login = True
             try:
-                logged_in = await lc_login()
+                # Reduit ou sans le focus : la fenetre attend le retour de l'utilisateur
+                if await _wait_for_main_window():
+                    if await lc_login():
+                        ok, err = await check_lc_session()
+                    else:
+                        _snooze_login()
             finally:
                 _status_login = False
-            if logged_in:
-                ok, err = await check_lc_session()
-            else:
-                _snooze_login()
     finally:
         _status_session = False
     if not ok and err and ("HTTP 403" in err or err in ("REQUIRED_READING", "LOGIN_REQUIRED", "CLOUDFLARE_CHALLENGE")):
