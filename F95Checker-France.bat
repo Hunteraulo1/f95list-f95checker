@@ -17,6 +17,11 @@ if /i "%~1"=="--startup" (
     set "UPDATE_PROMPT=1"
     set "PAUSE_CMD=call"
 )
+REM Equivalent de F95Checker-Debug.exe : console ouverte et mode debug
+if /i "%~1"=="debug" (
+    shift
+    set "DEBUG_MODE=1"
+)
 if defined UPDATE_REPO_RAW call :self_update
 if errorlevel 1 exit /b 0
 
@@ -81,6 +86,7 @@ if errorlevel 1 (
     %PAUSE_CMD%
     exit /b 1
 )
+if defined DEBUG_MODE goto :launch_debug
 echo.
 echo Lancement de F95Checker...
 start "" /D "%SRCDIR%" "%PYW%" main.py
@@ -88,6 +94,18 @@ echo F95Checker demarre (fenetre separee, sans console).
 echo.
 REM Fermer cette console si le .bat a ete ouvert par double-clic
 echo %CMDCMDLINE% | findstr /I /C:"/c" >nul && exit
+exit /b 0
+
+:launch_debug
+echo.
+echo Lancement de F95Checker en mode debug...
+echo Si F95Checker tourne deja, fermez-le d'abord : sinon cette console ne suivra pas l'application.
+echo.
+cd /d "%SRCDIR%"
+%PY% main-debug.py
+echo.
+echo F95Checker s'est arrete (code %ERRORLEVEL%).
+pause
 exit /b 0
 
 :install_python
@@ -113,6 +131,7 @@ set "SH_TARGET=%~dp0F95Checker-France.sh"
 set "SELF_BAT=%~f0"
 set "F95_RELUNCH_ARGS=%*"
 if defined UPDATE_PROMPT set "F95_RELUNCH_ARGS=--no-update"
+if defined DEBUG_MODE set "F95_RELUNCH_ARGS=debug"
 set "UPDATE_DECLINED=%~dp0._f95_france_cache\declined_launcher_update.txt"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference='Stop'; $base=$env:UPDATE_REPO_RAW; $batChanged=$false; try { Invoke-WebRequest -Uri ($base+'/F95Checker-France.bat') -OutFile $env:UPDATE_TMP -UseBasicParsing -TimeoutSec 30; $a=(Get-FileHash -Algorithm SHA256 $env:UPDATE_TMP).Hash; $b=(Get-FileHash -Algorithm SHA256 $env:SELF_BAT).Hash; if($a -ne $b){ $batChanged=$true } else { Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue } } catch { $batChanged=$false }; if($batChanged -and $env:UPDATE_PROMPT){ if((Test-Path $env:UPDATE_DECLINED) -and ((Get-Content $env:UPDATE_DECLINED -Raw).Trim() -eq $a)){ Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue; exit 0 }; Add-Type -AssemblyName System.Windows.Forms; $owner=New-Object System.Windows.Forms.Form -Property @{TopMost=$true}; $answer=[System.Windows.Forms.MessageBox]::Show($owner,'Une nouvelle version du launcher F95Checker France est disponible. Mettre a jour maintenant ?','F95Checker France',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question); if($answer -ne [System.Windows.Forms.DialogResult]::Yes){ Set-Content -Path $env:UPDATE_DECLINED -Value $a; Remove-Item $env:UPDATE_TMP -ErrorAction SilentlyContinue; exit 0 } }; try { $tmpSh=[IO.Path]::GetTempFileName(); Invoke-WebRequest -Uri ($base+'/F95Checker-France.sh') -OutFile $tmpSh -UseBasicParsing -TimeoutSec 30; $needSh=$true; if(Test-Path $env:SH_TARGET){ $c=(Get-FileHash -Algorithm SHA256 $tmpSh).Hash; $d=(Get-FileHash -Algorithm SHA256 $env:SH_TARGET).Hash; $needSh=($c -ne $d) }; if($needSh){ Copy-Item $tmpSh $env:SH_TARGET -Force; Write-Host 'F95Checker-France.sh mis a jour (pour tes utilisateurs Linux).' }; Remove-Item $tmpSh -ErrorAction SilentlyContinue } catch {}; if($batChanged){ exit 1 } else { exit 0 } }"
 if errorlevel 1 goto :self_update_apply_bat

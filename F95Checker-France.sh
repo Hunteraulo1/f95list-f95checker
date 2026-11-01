@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Equivalent Linux du launcher F95Checker-France.bat
-# Usage: ./f95checker-france.sh [reconfigure|setup-only]
+# Usage: ./f95checker-france.sh [reconfigure|setup-only|debug]
 #
 # Ce script lit F95Checker-France.bat (doit etre dans le meme dossier),
 # en extrait les blocs Python embarques, puis installe/lance F95Checker
@@ -65,6 +65,7 @@ fi
 
 EXTRA=""
 DO_LAUNCH=1
+DEBUG_MODE=0
 case "${1:-}" in
     reconfigure|--reconfigure)
         EXTRA="--reconfigure"
@@ -73,6 +74,9 @@ case "${1:-}" in
     setup-only)
         EXTRA="--setup-only"
         DO_LAUNCH=0
+        ;;
+    debug)
+        DEBUG_MODE=1
         ;;
 esac
 
@@ -149,6 +153,14 @@ fi
 if ! "$PY" -m py_compile "$SRCDIR/modules/gui.py" 2>/dev/null; then
     echo "gui.py invalide. Relance ce script pour reparer le patch." >&2
     exit 1
+fi
+
+if [[ "$DEBUG_MODE" == "1" ]]; then
+    echo
+    echo "Lancement de F95Checker en mode debug..."
+    echo "Si F95Checker tourne deja, ferme-le d'abord : sinon ce terminal ne suivra pas l'application."
+    echo
+    exec "$PY" "$SRCDIR/main-debug.py"
 fi
 
 echo

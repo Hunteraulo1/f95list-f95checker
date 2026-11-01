@@ -13,8 +13,8 @@ Ce depot ne fork pas le code de F95Checker : il fournit un **launcher tout-en-un
 
 ## Installation
 
-- **Windows** : lancer `F95Checker-France.bat` (double-clic ou `F95Checker-France.bat reconfigure` pour reconfigurer, `setup-only` pour installer sans lancer l'app). Rien a installer au prealable : si Git ou Python 3.12 manquent, le launcher les telecharge dans `._f95_france_cache/`, sans droits administrateur. Seule la cle API F95-France est demandee au premier lancement.
-- **Linux** : lancer `./F95Checker-France.sh` (memes options : `reconfigure`, `setup-only`). Necessite Python 3.11+ ; un venv local est cree automatiquement dans `.venv/`.
+- **Windows** : lancer `F95Checker-France.bat` (double-clic ou `F95Checker-France.bat reconfigure` pour reconfigurer, `setup-only` pour installer sans lancer l'app, `debug` ou `F95Checker-France-Debug.bat` pour lancer l'app avec une console et ses journaux). Rien a installer au prealable : si Git ou Python 3.12 manquent, le launcher les telecharge dans `._f95_france_cache/`, sans droits administrateur. Seule la cle API F95-France est demandee au premier lancement.
+- **Linux** : lancer `./F95Checker-France.sh` (memes options : `reconfigure`, `setup-only`, `debug`). Necessite Python 3.11+ ; un venv local est cree automatiquement dans `.venv/`.
 
 Le code source de F95Checker est recupere dans `F95Checker-src/` depuis le depot officiel [WillyJL/F95Checker](https://github.com/WillyJL/F95Checker.git).
 
