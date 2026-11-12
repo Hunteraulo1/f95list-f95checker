@@ -1870,7 +1870,7 @@ _BROWSER_IDLE_MS = 2 * 60 * 1000
 # Liste des dernieres mises a jour (page Latest Updates V2) : evite une requete par jeu a
 # chaque refresh : LewdCorner est strict, seul un Full Refresh manuel demande toutes les pages.
 # La marge couvre aussi son tri, pas strictement chronologique.
-_LC_UPDATES_URL = f"https://{LC_HOST_MARKER}/latest-updatesv2/api?view=all&sort=date&cat=All&tier=All&per_page=60&page="
+_LC_UPDATES_URL = f"https://{LC_HOST_MARKER}/latest-updates/api?view=all&sort=date&cat=All&tier=All&per_page=60&page="
 _LC_UPDATES_MAX_PAGES = 20
 _LC_FIRST_LOOKBACK = 30 * 24 * 60 * 60
 _LC_FEED_MARGIN = 60 * 60
@@ -2807,23 +2807,27 @@ def _parse_updates_page(data: bytes) -> tuple[dict[int, float], bool] | None:
         return None
 
 
-async def _fetch_recent_updates(since: float) -> dict[int, float] | None:
+async def _fetch_recent_updates(since: float) -> tuple[dict[int, float] | None, str | None]:
     """Parcourt les mises a jour jusqu'a la date demandee, sans depasser le plafond de pages
-    (plus de 1000 mises a jour, soit des semaines d'absence). None si la liste est illisible."""
+    (plus de 1000 mises a jour, soit des semaines d'absence). (None, cause) si la liste est illisible."""
     import asyncio
 
     updates = {}
     for page in range(1, _LC_UPDATES_MAX_PAGES + 1):
-        data, _ = await _fetch_page(f"{_LC_UPDATES_URL}{page}")
-        parsed = _parse_updates_page(data) if data else None
-        if not parsed or not parsed[0]:
-            return None
+        data, err = await _fetch_page(f"{_LC_UPDATES_URL}{page}")
+        if not data:
+            return None, err or "reponse vide"
+        parsed = _parse_updates_page(data)
+        if not parsed:
+            return None, "reponse illisible"
+        if not parsed[0]:
+            return None, "liste vide"
         items, has_more = parsed
         updates.update(items)
         if not has_more or min(items.values()) < since:
-            return updates
+            return updates, None
         await asyncio.sleep(_LC_REQUEST_DELAY)
-    return updates
+    return updates, None
 
 
 async def _games_to_refresh(games: list, full: bool, selection: bool) -> list:
@@ -2841,10 +2845,10 @@ async def _games_to_refresh(games: list, full: bool, selection: bool) -> list:
         return games
     last_check = _load_feed_state().get("last_check", now - _LC_FIRST_LOOKBACK)
     since = last_check - _LC_FEED_MARGIN
-    updates = await _fetch_recent_updates(since)
+    updates, err = await _fetch_recent_updates(since)
     if updates is None:
         # Jamais de repli sur toutes les pages : le prochain refresh reprendra depuis last_check
-        _failed_games.setdefault("Liste des mises a jour LewdCorner indisponible.", []).extend(game.name for game in games)
+        _failed_games.setdefault(f"Liste des mises a jour LewdCorner indisponible ({err}).", []).extend(game.name for game in games)
         return []
     _feed_state_pending = {"last_check": now}
     return [
@@ -2944,11 +2948,23 @@ async def start_refresh(games: list, updates: dict | None = None, *, full: bool 
     return [asyncio.create_task(refresh_lc_game(game, updates)) for game in selected]
 
 
+def _push_lc_popup(message: str, more: str) -> None:
+    """Remplace une popup LewdCorner identique encore ouverte au lieu d'en empiler une de plus
+    a chaque refresh (sinon des dizaines s'accumulent quand F95Checker tourne en arriere-plan)."""
+    from common.structs import MsgBox
+    from modules import globals, msgbox, utils
+
+    for popup in globals.popup_stack:
+        if popup.open and popup.func is msgbox.msgbox and popup.args[:2] == ("LewdCorner", message):
+            # Fermee au prochain rendu par Popup.__call__
+            popup.open = False
+    utils.push_popup(msgbox.msgbox, "LewdCorner", message, MsgBox.warn, more=more)
+
+
 def report_session_expired() -> None:
     """Affiche une seule popup pour tous les jeux LC refuses en 403 pendant ce refresh,
     et une par type d'erreur pour les autres echecs."""
-    from common.structs import MsgBox
-    from modules import globals, msgbox, utils
+    from modules import globals
 
     global _feed_state_pending
     # Refresh interrompu par le site : les jeux restants n'ont pas ete vus. Un echec isole
@@ -2965,20 +2981,14 @@ def report_session_expired() -> None:
 
     for error_msg, failed in _failed_games.items():
         names = sorted(set(failed))
-        utils.push_popup(
-            msgbox.msgbox, "LewdCorner",
-            f"{len(names)} jeu(x) LewdCorner non verifie(s) :\n{error_msg}",
-            MsgBox.warn,
-            more="\n".join(names),
-        )
+        _push_lc_popup(f"{len(names)} jeu(x) LewdCorner non verifie(s) :\n{error_msg}", "\n".join(names))
     _failed_games.clear()
 
     if not _session_expired_games:
         return
     names = sorted(set(_session_expired_games))
     _session_expired_games.clear()
-    utils.push_popup(
-        msgbox.msgbox, "LewdCorner",
+    _push_lc_popup(
         f"{len(names)} jeu(x) LewdCorner non verifie(s) : session expiree ou refusee.\n"
         f"Cause : {_session_failure_text(_session_expired_reason)}\n"
         + (
@@ -2986,8 +2996,7 @@ def report_session_expired() -> None:
             if "CLOUDFLARE_CHALLENGE" in _session_expired_reason
             else "Reconnectez-vous via le bouton Se connecter dans la sidebar LewdCorner."
         ),
-        MsgBox.warn,
-        more="\n".join(names),
+        "\n".join(names),
     )
 
 
