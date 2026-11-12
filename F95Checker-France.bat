@@ -1424,6 +1424,40 @@ def apply_ddl_patches() -> None:
     print("Extraction Donor DDL intelligente + ajout auto de l'exe (api.py, structs.py).")
 
 
+GUI_TR_TAB_OLD = """                if imgui.begin_tab_item((
+                    icons.draw_pen if game.notes else"""
+
+GUI_TR_TAB_NEW = """                france_labels.draw_translations_tab(game)
+
+""" + GUI_TR_TAB_OLD
+
+WEBVIEW_FR_DOWNLOAD = """
+
+def fr_download(*args, **kwargs):
+    from modules import france_labels
+    france_labels.browser_download_daemon(*args, **kwargs)
+"""
+
+
+def apply_translation_patches() -> None:
+    """Onglet "F95 France" (traductions) dans la fiche d'un jeu + telechargement via navigateur.
+    Optionnel : si l'amont a change, on previent sans bloquer le lancement."""
+    gui = SRC / "modules" / "gui.py"
+    gui_text = gui.read_text(encoding="utf-8")
+    if "draw_translations_tab" not in gui_text:
+        if gui_text.count(GUI_TR_TAB_OLD) != 1:
+            print("ATTENTION : gui.py a change, onglet traductions F95 France impossible.")
+        else:
+            gui.write_text(gui_text.replace(GUI_TR_TAB_OLD, GUI_TR_TAB_NEW, 1), encoding="utf-8")
+            verify_gui()
+            print("Onglet traductions F95 France ajoute (gui.py).")
+    webview_module = SRC / "modules" / "webview.py"
+    webview_text = webview_module.read_text(encoding="utf-8")
+    if "def fr_download" not in webview_text:
+        webview_module.write_text(webview_text.rstrip("\n") + "\n" + WEBVIEW_FR_DOWNLOAD, encoding="utf-8")
+        print("Telechargement de traductions via navigateur ajoute (webview.py).")
+
+
 def apply_patches() -> None:
     shutil.copy2(PATCH_DIR / "france_labels.py", SRC / "modules" / "france_labels.py")
     print("Module france_labels.py installe.")
@@ -1494,6 +1528,7 @@ def apply_patches() -> None:
             py_compile.compile(str(meta_module), doraise=True)
             print("Commit F95Checker-src affiche a la place du numero de build (meta.py).")
     apply_ddl_patches()
+    apply_translation_patches()
     apply_lc_patches()
 
 
@@ -2063,6 +2098,761 @@ async def check_updates_from_gui() -> None:
         )
     finally:
         _checking_updates = False
+# ---------------------------------------------------------------------------
+# Traductions F95-France : onglet "F95 France" dans la fiche d'un jeu,
+# telechargement a la demande (Mega, Google Drive, kDrive, Pixeldrain)
+# puis installation dans le dossier du jeu apres confirmation.
+# ---------------------------------------------------------------------------
+
+import base64
+import re
+import struct
+import time
+import urllib.parse
+
+_tr_catalog: dict | None = None
+_tr_loading = False
+_tr_error = ""
+_tr_loaded_at = 0.0
+_TR_CACHE_SECONDS = 15 * 60
+_tr_states: dict[str, str] = {}
+
+_TR_STATUS = {
+    "completed": ("Terminee", (0.30, 0.69, 0.31)),
+    "in_progress": ("En cours", (1.00, 0.65, 0.15)),
+    "abandoned": ("Abandonnee", (0.90, 0.30, 0.30)),
+}
+_TR_TYPE = {
+    "auto": "Automatique",
+    "semi-auto": "Semi-automatique",
+    "manual": "Manuelle",
+    "to_tested": "A tester",
+    "vf": "VF officielle",
+    "hs": "Hors service",
+}
+_TR_DOC_SUFFIXES = {".txt", ".md", ".url", ".pdf", ".html", ".htm", ".nfo", ".lnk", ".rtf", ".doc", ".docx"}
+_TR_JUNK = {"__macosx", ".ds_store", "thumbs.db", "desktop.ini"}
+_TR_RENPY_SUFFIXES = {".rpy", ".rpyc", ".rpa", ".rpym", ".rpymc", ".ttf", ".otf"}
+
+
+def _api_base() -> str:
+    url = _resolve_api_url(load_config())
+    return url.rsplit("/games", 1)[0] if "/games" in url else url.rstrip("/")
+
+
+def _api_get_json(path: str):
+    cfg = load_config()
+    api_key = cfg["france"].get("api_key", "")
+    if not api_key.strip():
+        raise ValueError("Cle API F95-France manquante (relancez le launcher pour la configurer).")
+    req = urllib.request.Request(
+        _api_base() + path,
+        headers=_request_headers(api_key, cfg["france"].get("auth_mode", "bearer")),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=_SSL_CONTEXT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise ValueError(_api_error_message(exc.code, exc.read())) from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Reseau : {exc.reason}") from exc
+
+
+def _load_translations_catalog() -> dict:
+    games = _api_get_json("/games")
+    translations = _api_get_json("/translations")
+    try:
+        translators = _api_get_json("/translators")
+    except ValueError:
+        translators = []
+    if not isinstance(games, list) or not isinstance(translations, list):
+        raise ValueError("Reponse API inattendue.")
+    by_thread: dict[tuple[str, int], str] = {}
+    for g in games:
+        if isinstance(g, dict) and isinstance(g.get("threadId"), (int, float)) and g.get("id"):
+            by_thread[(str(g.get("website") or "").lower(), int(g["threadId"]))] = g["id"]
+    by_game: dict[str, list[dict]] = {}
+    for t in translations:
+        if isinstance(t, dict) and t.get("gameId"):
+            by_game.setdefault(t["gameId"], []).append(t)
+    names = {t["id"]: t.get("name") or "" for t in translators if isinstance(t, dict) and t.get("id")}
+    return {"by_thread": by_thread, "by_game": by_game, "translators": names}
+
+
+async def _refresh_translations_catalog() -> None:
+    global _tr_catalog, _tr_loading, _tr_error, _tr_loaded_at
+    if _tr_loading:
+        return
+    _tr_loading = True
+    _tr_error = ""
+    try:
+        loop = asyncio.get_event_loop()
+        _tr_catalog = await loop.run_in_executor(None, _load_translations_catalog)
+        _tr_loaded_at = time.time()
+    except ValueError as exc:
+        _tr_error = str(exc)
+    except Exception as exc:
+        _tr_error = f"Erreur : {exc}"
+    finally:
+        _tr_loading = False
+
+
+def _game_translations(game) -> list[dict] | None:
+    if _tr_catalog is None:
+        return None
+    if game.custom:
+        if not _is_lc_thread_url(game.url):
+            return []
+        key = ("lc", _thread_id_from_url(game.url))
+    else:
+        key = ("f95z", game.id)
+    game_id = _tr_catalog["by_thread"].get(key)
+    if not game_id:
+        return []
+    order = {"completed": 0, "in_progress": 1, "abandoned": 2}
+    return sorted(
+        _tr_catalog["by_game"].get(game_id, []),
+        key=lambda t: (t.get("tname") == "integrated", order.get(t.get("status"), 3), t.get("updatedAt") or ""),
+    )
+
+
+def _norm_version(version: str) -> str:
+    v = (version or "").strip().lower()
+    v = re.sub(r"^(?:version|ver\.?|v)\s*", "", v)
+    return re.sub(r"\s+", " ", v)
+
+
+def _game_version(game) -> tuple[str, str]:
+    if game.installed:
+        return game.installed, "installee"
+    return game.version or "", "derniere"
+
+
+def _host_of(link: str) -> str:
+    host = urllib.parse.urlparse(link or "").netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _direct_kind(link: str) -> str | None:
+    if not link:
+        return None
+    if re.search(r"mega\.nz/(?:file/[\w-]+#[\w-]+|#![\w-]+![\w-]+)", link):
+        return "mega"
+    if re.search(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?)", link):
+        return "gdrive"
+    if re.search(r"kdrive\.infomaniak\.com/app/share/\d+/[\w-]+", link):
+        return "kdrive"
+    if re.search(r"pixeldrain\.com/(?:u|api/file)/\w+", link):
+        return "pixeldrain"
+    return None
+
+
+def _b64url(text: str) -> bytes:
+    text = text.replace("-", "+").replace("_", "/").replace(",", "")
+    return base64.b64decode(text + "=" * (-len(text) % 4))
+
+
+def _mega_keys(key_b64: str) -> tuple[bytes, bytes]:
+    k = struct.unpack(">8I", _b64url(key_b64))
+    aes_key = struct.pack(">4I", *(k[i] ^ k[i + 4] for i in range(4)))
+    iv = struct.pack(">2I", k[4], k[5]) + b"\0" * 8
+    return aes_key, iv
+
+
+def _mega_decrypt_name(aes_key: bytes, attributes: str) -> str:
+    from Cryptodome.Cipher import AES
+    raw = AES.new(aes_key, AES.MODE_CBC, b"\0" * 16).decrypt(_b64url(attributes)).rstrip(b"\0")
+    if not raw.startswith(b"MEGA"):
+        raise ValueError("Cle Mega invalide.")
+    return json.loads(raw[4:].decode("utf-8", errors="replace")).get("n") or "traduction"
+
+
+def _mega_decrypt_file(src: Path, dst: Path, aes_key: bytes, iv: bytes) -> None:
+    from Cryptodome.Cipher import AES
+    cipher = AES.new(aes_key, AES.MODE_CTR, nonce=b"", initial_value=iv)
+    with src.open("rb") as fin, dst.open("wb") as fout:
+        while chunk := fin.read(4 * 1024 * 1024):
+            fout.write(cipher.decrypt(chunk))
+
+
+def _filename_from_disposition(value: str) -> str:
+    if not value:
+        return ""
+    if m := re.search(r"filename\*\s*=\s*[^']*''([^;]+)", value, re.IGNORECASE):
+        return urllib.parse.unquote(m.group(1).strip().strip('"'))
+    if m := re.search(r'filename\s*=\s*"?([^";]+)"?', value, re.IGNORECASE):
+        return m.group(1).strip()
+    return ""
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return name[:150] or "traduction"
+
+
+async def _resolve_direct_link(link: str) -> dict:
+    """Retourne {url, name, size, mega} pour un lien d'hebergeur supporte."""
+    from modules import api
+
+    kind = _direct_kind(link)
+    if kind == "pixeldrain":
+        file_id = re.search(r"pixeldrain\.com/(?:u|api/file)/(\w+)", link).group(1)
+        info = json.loads(await api.fetch("GET", f"https://pixeldrain.com/api/file/{file_id}/info", cookies=False))
+        return {"url": f"https://pixeldrain.com/api/file/{file_id}?download", "name": info.get("name") or file_id, "size": info.get("size"), "mega": None}
+
+    if kind == "gdrive":
+        m = re.search(r"/d/([\w-]+)", link) or re.search(r"[?&]id=([\w-]+)", link)
+        url = f"https://drive.usercontent.google.com/download?id={m.group(1)}&export=download&confirm=t"
+        async with api.request("GET", url, read=False, cookies=False) as (_, req):
+            if "text/html" in (req.headers.get("Content-Type") or ""):
+                raise LookupError("Google Drive demande une confirmation manuelle.")
+            name = _filename_from_disposition(req.headers.get("Content-Disposition", ""))
+            size = req.content_length
+        return {"url": url, "name": name or m.group(1), "size": size, "mega": None}
+
+    if kind == "kdrive":
+        drive, share = re.search(r"share/(\d+)/([\w-]+)", link).groups()
+        base = f"https://kdrive.infomaniak.com/2/app/{drive}/share/{share}"
+        init = json.loads(await api.fetch("GET", f"{base}/init", cookies=False))
+        file_id = init["data"]["file_id"]
+        info = json.loads(await api.fetch("GET", f"{base}/files/{file_id}", cookies=False))["data"]
+        name = info.get("name") or str(file_id)
+        if info.get("type") == "dir":
+            name += ".zip"
+        return {"url": f"{base}/files/{file_id}/download", "name": name, "size": info.get("size") if info.get("type") != "dir" else None, "mega": None}
+
+    if kind == "mega":
+        m = re.search(r"mega\.nz/file/([\w-]+)#([\w-]+)", link) or re.search(r"mega\.nz/#!([\w-]+)!([\w-]+)", link)
+        file_id, key = m.groups()
+        aes_key, iv = _mega_keys(key)
+        res = json.loads(await api.fetch(
+            "POST", "https://g.api.mega.co.nz/cs?id=0",
+            json=[{"a": "g", "g": 1, "ssl": 2, "p": file_id}], cookies=False,
+        ))
+        res = res[0] if isinstance(res, list) else res
+        if isinstance(res, int):
+            raise LookupError(f"Mega a refuse le lien (erreur {res}), il est peut-etre expire.")
+        return {"url": res["g"], "name": _mega_decrypt_name(aes_key, res["at"]), "size": res.get("s"), "mega": (aes_key, iv)}
+
+    raise LookupError("Hebergeur non supporte.")
+
+
+def _game_root(game) -> Path | None:
+    from modules import globals, utils
+
+    base = globals.settings.default_exe_dir.get(globals.os)
+    for executable in game.executables:
+        if utils.is_uri(executable):
+            continue
+        exe = Path(executable)
+        if not exe.is_absolute() and base:
+            exe = Path(base) / exe
+        if exe.is_file():
+            return exe.parent
+        if exe.is_dir():
+            return exe.parent if exe.suffix.lower() == ".app" else exe
+    return None
+
+
+def _is_doc(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in _TR_DOC_SUFFIXES
+
+
+def _children(folder: Path) -> list[Path]:
+    return [c for c in folder.iterdir() if c.name.lower() not in _TR_JUNK]
+
+
+def _plan_install(extracted: Path, game_root: Path, renpy: bool) -> tuple[list[tuple[Path, Path]], str] | None:
+    """Determine quoi copier ou dans le dossier du jeu. None si structure non reconnue."""
+    root_names = {c.name.lower() for c in game_root.iterdir() if c.is_dir()}
+    renpy = renpy or "game" in root_names and (game_root / "renpy").is_dir()
+
+    # Descend dans les dossiers "enveloppe" (FR_Jeu-0.1/...), sans depasser un dossier du jeu (game/, www/...)
+    src = extracted
+    while True:
+        kids = [c for c in _children(src) if not _is_doc(c)]
+        if len(kids) == 1 and kids[0].is_dir() and kids[0].name.lower() not in root_names | {"tl"}:
+            src = kids[0]
+        else:
+            break
+
+    # Un dossier de l'archive qui existe aussi a la racine du jeu (game/, www/, Jeu_Data/...)
+    level = [src]
+    for _ in range(4):
+        for folder in level:
+            if any(c.is_dir() and c.name.lower() in root_names for c in _children(folder)):
+                return [(c, game_root / c.name) for c in _children(folder) if not _is_doc(c)], "racine du jeu"
+        level = [c for f in level for c in _children(f) if c.is_dir()]
+
+    # Ren'Py : fichiers de traduction en vrac (.rpa, .rpy, tl/) -> game/
+    if renpy:
+        kids = [c for c in _children(src) if not _is_doc(c)]
+        if kids and all(c.suffix.lower() in _TR_RENPY_SUFFIXES or (c.is_dir() and c.name.lower() == "tl") for c in kids):
+            return [(c, game_root / "game" / c.name) for c in kids], "dossier game/"
+    return None
+
+
+def _count_plan(plan: list[tuple[Path, Path]]) -> tuple[int, int]:
+    total = replaced = 0
+    for src, dst in plan:
+        files = [(src, dst)] if src.is_file() else [(f, dst / f.relative_to(src)) for f in src.rglob("*") if f.is_file()]
+        for _, target in files:
+            total += 1
+            replaced += target.exists()
+    return total, replaced
+
+
+def _execute_plan(plan: list[tuple[Path, Path]]) -> int:
+    copied = 0
+    for src, dst in plan:
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+            continue
+        for f in src.rglob("*"):
+            if f.is_file() and f.name.lower() not in _TR_JUNK:
+                target = dst / f.relative_to(src)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+                copied += 1
+    return copied
+
+
+def _archive_stem_fr(name: str) -> str:
+    lower = name.lower()
+    for _, extensions, _ in shutil.get_unpack_formats():
+        for ext in sorted(extensions, key=len, reverse=True):
+            if lower.endswith(ext) and len(name) > len(ext):
+                return name[:-len(ext)].rstrip(" .") or name
+    return Path(name).stem or name
+
+
+def _unpack_translation(file: Path) -> Path:
+    target = file.parent / _archive_stem_fr(file.name)
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    fmt = shutil._find_unpack_format(str(file))
+    if fmt:
+        shutil.unpack_archive(file, target, fmt)
+    else:
+        target.mkdir(parents=True)
+        shutil.copy2(file, target / file.name)
+    return target
+
+
+def _push_msg(text: str, level=None, buttons=True) -> None:
+    from common.structs import MsgBox
+    from modules import msgbox, utils
+    utils.push_popup(msgbox.msgbox, "Traduction F95-France", text, level or MsgBox.info, buttons)
+
+
+def _offer_install(game, translation: dict, extracted: Path) -> None:
+    from common.structs import MsgBox
+    from external import async_thread
+    from modules import callbacks, icons
+
+    open_folder = (f"{icons.folder_open_outline} Ouvrir le dossier", lambda: async_thread.run(callbacks.default_open(str(extracted))))
+    game_root = _game_root(game)
+    if game_root is None:
+        def _after_exe(selected):
+            if selected:
+                _offer_install(game, translation, extracted)
+        _push_msg(
+            f"Traduction telechargee dans :\n{extracted}\n\n"
+            "Aucun executable n'est defini pour ce jeu, impossible de savoir ou l'installer.\n"
+            "Choisis l'exe du jeu pour continuer, ou installe la traduction a la main.",
+            MsgBox.warn,
+            {
+                f"{icons.open_in_app} Choisir l'exe": lambda: callbacks.add_game_exe(game, _after_exe),
+                open_folder[0]: open_folder[1],
+                f"{icons.cancel} Annuler": None,
+            },
+        )
+        return
+
+    def _install(plan):
+        async def _run():
+            try:
+                loop = asyncio.get_event_loop()
+                copied = await loop.run_in_executor(None, _execute_plan, plan)
+                _push_msg(f"Traduction installee : {copied} fichier(s) copies dans\n{game_root}")
+            except Exception as exc:
+                _push_msg(f"Installation impossible :\n{exc}", MsgBox.error)
+        async_thread.run(_run())
+
+    plan = _plan_install(extracted, game_root, translation.get("gameType") == "renpy")
+    if plan is None:
+        src = extracted
+        while len(kids := [c for c in _children(src) if not _is_doc(c)]) == 1 and kids[0].is_dir():
+            src = kids[0]
+        fallback = [(c, game_root / c.name) for c in _children(src) if not _is_doc(c)]
+        _push_msg(
+            f"Traduction telechargee dans :\n{extracted}\n\n"
+            "Structure de la traduction non reconnue : je ne sais pas ou la placer.\n"
+            f"Tu peux copier son contenu a la racine du jeu ({game_root}),\n"
+            "ou ouvrir le dossier pour l'installer a la main (voir le fichier A_Lire / readme s'il y en a un).",
+            MsgBox.warn,
+            {
+                f"{icons.check} Copier a la racine du jeu": lambda: _install(fallback),
+                open_folder[0]: open_folder[1],
+                f"{icons.cancel} Annuler": None,
+            },
+        )
+        return
+
+    plan, where = plan
+    total, replaced = _count_plan(plan)
+    targets = "\n".join(f"  - {dst.relative_to(game_root).as_posix()}{'/' if src.is_dir() else ''}" for src, dst in plan[:8])
+    if len(plan) > 8:
+        targets += f"\n  - ... (+{len(plan) - 8})"
+    _push_msg(
+        f"Installer la traduction dans le {where} ?\n\n"
+        f"Jeu : {game_root}\n"
+        f"{total} fichier(s) a copier, dont {replaced} remplacant des fichiers existants :\n{targets}",
+        MsgBox.info,
+        {
+            f"{icons.check} Installer": lambda: _install(plan),
+            open_folder[0]: open_folder[1],
+            f"{icons.cancel} Annuler": None,
+        },
+    )
+
+
+def _translation_folder(game) -> Path:
+    from modules import globals, utils
+    downloads_dir = globals.settings.downloads_dir.get(globals.os)
+    downloads_dir = Path(downloads_dir) if downloads_dir else Path.home() / "Downloads"
+    return downloads_dir / utils.clean_str(game.name)[:32] / "Traduction FR"
+
+
+async def _finish_download(game, translation: dict, download, final: Path, mega=None) -> None:
+    """Dechiffre (Mega), renomme, extrait puis propose l'installation."""
+    try:
+        download.state = download.State.Extracting
+        loop = asyncio.get_event_loop()
+        def _finish():
+            if download.path != final:
+                if final.exists():
+                    final.unlink()
+                if mega:
+                    _mega_decrypt_file(download.path, final, *mega)
+                    download.path.unlink()
+                else:
+                    download.path.rename(final)
+                download.path = final
+            return _unpack_translation(final)
+        download.extracted = await loop.run_in_executor(None, _finish)
+        download.total = download.progress  # Taille parfois inconnue a l'avance (kDrive, navigateur)
+    except Exception as exc:
+        download.error = f"Extraction impossible : {exc}"
+        return
+    finally:
+        download.state = download.State.Stopped
+    _offer_install(game, translation, download.extracted)
+
+
+async def _download_translation(game, translation: dict) -> None:
+    from common.structs import FileDownload
+    from modules import api
+
+    tid = translation["id"]
+    link = translation.get("tlink") or ""
+    if not _direct_kind(link):
+        await _browser_download(game, translation)
+        return
+    _tr_states[tid] = "Recherche du fichier..."
+    try:
+        info = await _resolve_direct_link(link)
+    except Exception:
+        # Lien direct qui ne repond pas comme prevu : on passe par le navigateur (sans re-intercepter ce lien)
+        _tr_states.pop(tid, None)
+        await _browser_download(game, translation, intercept=False)
+        return
+    _tr_states.pop(tid, None)
+
+    folder = _translation_folder(game)
+    name = _safe_filename(info["name"])
+    download = FileDownload(f"[FR] {name}", cookies=False, total=info["size"])
+    download.path = folder / f"{name}.part"  # .part : download_file() ne doit pas l'extraire lui-meme
+    download.path_nest_level = 2
+    download.url = info["url"]
+    api.downloads[f"fr/{tid}"] = download
+
+    await api.download_file(download)
+    if download.error or download.cancel:
+        return
+    await _finish_download(game, translation, download, folder / name, info["mega"])
+
+
+async def _browser_download(game, translation: dict, intercept: bool = True) -> None:
+    """Ouvre le lien dans le navigateur integre ; des qu'un telechargement demarre,
+    la fenetre se reduit et le fichier arrive dans le dossier de traductions du jeu.
+    Si la page mene a un hebergeur gere en direct (Mega, Drive...), on bascule dessus."""
+    from common.structs import DaemonPipe, FileDownload
+    from modules import api, webview
+
+    tid = translation["id"]
+    link = translation.get("tlink") or ""
+    folder = _translation_folder(game)
+    key = f"fr/{tid}"
+    download = None
+    final = None
+    direct = None
+    _tr_states[tid] = "Navigateur ouvert : clique sur le bouton de telechargement de la page"
+    try:
+        with await webview.start(
+            "fr_download", link, str(folder), intercept,
+            title=f"Traduction FR : {game.name} (le telechargement sera recupere automatiquement)",
+            size=(1100, 800),
+            extension=False,  # Le script de l'extension casse certains sites (Mega : "redefine property: sleep")
+            pipe=True,
+        ) as pipe:
+            while True:
+                if download is not None and download.cancel:
+                    pipe.kill()
+                    download.error = "Interrompu par l'utilisateur"
+                    break
+                try:
+                    msg = await asyncio.wait_for(pipe.get_async(), timeout=0.5)
+                except (asyncio.TimeoutError, TimeoutError):
+                    continue
+                if not isinstance(msg, list) or not msg:
+                    continue
+                if msg[0] == "started":
+                    _tr_states.pop(tid, None)
+                    name = msg[1]
+                    download = FileDownload(f"[FR] {name}", cookies=False, total=msg[2] if msg[2] > 0 else None)
+                    download.path = folder / name
+                    download.path_nest_level = 2
+                    download.url = link
+                    download.state = download.State.Downloading
+                    download.start = download.current = time.time()
+                    api.downloads[key] = download
+                elif msg[0] == "progress" and download is not None:
+                    download.progress = msg[1]
+                    if msg[2] > 0:
+                        download.total = msg[2]
+                    download.current = time.time()
+                elif msg[0] == "done" and download is not None:
+                    final = Path(msg[1])
+                    download.progress = msg[2]
+                    download.path = final
+                    break
+                elif msg[0] == "error":
+                    if download is not None:
+                        download.error = msg[1]
+                    break
+                elif msg[0] == "direct" and download is None:
+                    direct = msg[1]
+                    break
+    except DaemonPipe.DaemonPipeExit:
+        pass
+    finally:
+        _tr_states.pop(tid, None)
+    if direct:
+        await _download_translation(game, {**translation, "tlink": direct})
+        return
+    if download is None:
+        return  # Fenetre fermee sans telechargement
+    if final is None:
+        download.error = download.error or "Navigateur ferme avant la fin du telechargement"
+        download.state = download.State.Stopped
+        return
+    await _finish_download(game, translation, download, final)
+
+
+def browser_download_daemon(url: str, target_dir: str, intercept: bool = True, *, cookies: dict[str, str] = {}, cookies_domain: str = None, **kwargs):
+    """Processus navigateur (webview-daemon) : recupere le premier telechargement lance par la page."""
+    from PyQt6 import QtCore, QtNetwork, QtWebEngineCore
+    from modules import webview
+
+    app = webview.create(**kwargs)
+    if cookies and cookies_domain:
+        domain = QtCore.QUrl("https://" + cookies_domain)
+        for key, value in cookies.items():
+            app.window.webview.cookieStore.setCookie(
+                QtNetwork.QNetworkCookie(QtCore.QByteArray(key.encode()), QtCore.QByteArray(value.encode())), domain
+            )
+    profile = app.window.webview.profile
+    try:
+        profile.downloadRequested.disconnect()  # Pas de boite "Enregistrer sous"
+    except TypeError:
+        pass
+    State = QtWebEngineCore.QWebEngineDownloadRequest.DownloadState
+    current = {"dl": None, "last": 0.0}
+
+    def progress():
+        dl = current["dl"]
+        now = time.time()
+        if now - current["last"] >= 0.25:
+            current["last"] = now
+            app.pipe.put(["progress", dl.receivedBytes(), dl.totalBytes()])
+
+    def state_changed(state):
+        dl = current["dl"]
+        if state == State.DownloadCompleted:
+            app.pipe.put(["done", str(Path(dl.downloadDirectory()) / dl.downloadFileName()), dl.receivedBytes()])
+            app.quit()
+        elif state in (State.DownloadCancelled, State.DownloadInterrupted):
+            app.pipe.put(["error", dl.interruptReasonString() or "Telechargement annule"])
+            app.quit()
+
+    def requested(dl):
+        if current["dl"] is not None:
+            dl.cancel()
+            return
+        Path(target_dir).mkdir(parents=True, exist_ok=True)
+        dl.setDownloadDirectory(target_dir)
+        dl.setDownloadFileName(_safe_filename(dl.downloadFileName()))
+        current["dl"] = dl
+        dl.receivedBytesChanged.connect(progress)
+        dl.stateChanged.connect(state_changed)
+        dl.accept()
+        app.pipe.put(["started", dl.downloadFileName(), dl.totalBytes()])
+        app.window.showMinimized()
+
+    profile.downloadRequested.connect(requested)
+
+    def url_changed(new_url):
+        target = new_url.toString()
+        if intercept and current["dl"] is None and _direct_kind(target):
+            app.pipe.put(["direct", target])
+            app.quit()
+    app.window.webview.urlChanged.connect(url_changed)
+    app.window.webview.setUrl(QtCore.QUrl(url))
+    app.window.show()
+    app.exec()
+
+
+def _start_translation_download(game, translation: dict) -> None:
+    from external import async_thread
+    from modules import icons
+
+    wanted = _norm_version(translation.get("version") or "")
+    current, _ = _game_version(game)
+    def _go():
+        async_thread.run(_download_translation(game, translation))
+    if wanted and current and wanted != _norm_version(current):
+        _push_msg(
+            f"Cette traduction est prevue pour la version {translation.get('version')} du jeu,\n"
+            f"mais ton jeu est en version {current}.\n\n"
+            "Elle peut ne pas fonctionner (textes manquants, erreurs). Telecharger quand meme ?",
+            None,
+            {f"{icons.download} Telecharger quand meme": _go, f"{icons.cancel} Annuler": None},
+        )
+    else:
+        _go()
+
+
+def draw_translations_tab(game) -> None:
+    import imgui
+    from external import async_thread
+    from modules import api, callbacks, icons
+
+    icon = getattr(icons, "translate", "")
+    if not imgui.begin_tab_item(f"{icon} F95 France###f95france")[0]:
+        return
+    try:
+        imgui.spacing()
+        if (_tr_catalog is None or time.time() - _tr_loaded_at > _TR_CACHE_SECONDS) and not _tr_loading and not _tr_error:
+            async_thread.run(_refresh_translations_catalog())
+        if _tr_catalog is None:
+            if _tr_error:
+                imgui.text_colored(_tr_error, 0.9, 0.3, 0.3)
+                if imgui.small_button(f"{icons.refresh} Reessayer"):
+                    globals_reset_error()
+            else:
+                imgui.text_disabled("Chargement des traductions F95-France...")
+            return
+        translations = _game_translations(game)
+        current, current_kind = _game_version(game)
+        imgui.text_disabled(f"Version du jeu ({current_kind}) : {current or '?'}")
+        imgui.same_line()
+        if imgui.small_button(f"{icons.refresh}###fr_refresh"):
+            globals_reset_error()
+            async_thread.run(_refresh_translations_catalog())
+        if not translations:
+            imgui.spacing()
+            imgui.text_disabled("Aucune traduction F95-France pour ce jeu.")
+            return
+        for t in translations:
+            tid = t["id"]
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+            translator = _tr_catalog["translators"].get(t.get("translatorId"), "")
+            title = t.get("translationName") or ("Traduction integree au jeu" if t.get("tname") == "integrated" else "Traduction francaise")
+            if t.get("tname") == "translation_with_mods":
+                title += " + mods"
+            imgui.push_font(imgui.fonts.bold)
+            imgui.text(title)
+            imgui.pop_font()
+            if translator:
+                imgui.same_line()
+                imgui.text_disabled(f"par {translator}")
+            status, color = _TR_STATUS.get(t.get("status"), (t.get("status") or "?", (0.7, 0.7, 0.7)))
+            imgui.text_colored(status, *color)
+            imgui.same_line()
+            imgui.text_disabled(f"| {_TR_TYPE.get(t.get('ttype'), t.get('ttype') or '?')}")
+
+            wanted = t.get("version") or ""
+            imgui.text(f"Pour la version du jeu : {wanted or '?'}")
+            if t.get("tversion") and t.get("tversion") != wanted and t.get("tname") != "integrated":
+                imgui.same_line()
+                imgui.text_disabled(f"(traduction {t['tversion']})")
+            if wanted and current:
+                imgui.same_line()
+                if _norm_version(wanted) == _norm_version(current):
+                    imgui.text_colored(f"{icons.check} correspond a ton jeu", 0.30, 0.69, 0.31)
+                else:
+                    imgui.text_colored(f"{getattr(icons, 'alert', '!')} differente de ton jeu ({current})", 1.0, 0.65, 0.15)
+
+            link = t.get("tlink") or ""
+            if t.get("tname") == "integrated" or not link:
+                continue
+            kind = _direct_kind(link)
+            busy = _tr_states.get(tid) or (
+                (dl := api.downloads.get(f"fr/{tid}")) and dl.state not in (dl.State.Stopped, dl.State.Removed)
+            )
+            if busy:
+                imgui.push_disabled()
+            if imgui.button(f"{icons.download} Telecharger###fr_dl_{tid}"):
+                _start_translation_download(game, t)
+            if busy:
+                imgui.pop_disabled()
+            elif not kind:
+                imgui.same_line()
+                imgui.text_disabled("(?)")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "Cet hebergeur ne permet pas le telechargement direct.\n"
+                        "Une fenetre de navigateur s'ouvre : clique sur le bouton de telechargement\n"
+                        "de la page, F95Checker recupere le fichier automatiquement."
+                    )
+            imgui.same_line()
+            if imgui.button(f"{icons.open_in_new}###fr_open_{tid}"):
+                callbacks.open_webpage(link)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Ouvrir dans ton navigateur habituel")
+            imgui.same_line()
+            if imgui.button(f"{icons.content_copy}###fr_copy_{tid}"):
+                callbacks.clipboard_copy(link)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Copier le lien")
+            imgui.same_line()
+            imgui.text_disabled(_host_of(link) + ("" if kind else " (via navigateur)"))
+            if busy:
+                imgui.text_disabled(_tr_states.get(tid) or "Telechargement en cours (voir la barre laterale)")
+    finally:
+        imgui.end_tab_item()
+
+
+def globals_reset_error() -> None:
+    global _tr_error, _tr_loaded_at
+    _tr_error = ""
+    _tr_loaded_at = 0.0
+
 @@END_FRANCE_LABELS@@
 @@BEGIN_FRANCE_ICON@@
 """Icone F95Checker sous Windows (pythonw affiche sinon l'icone Python)."""
