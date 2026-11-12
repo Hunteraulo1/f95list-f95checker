@@ -861,6 +861,39 @@ API_LC_REPORT_NEW = """    lc_games.report_session_expired()
         await check_notifs(standalone=False)
 """
 
+# Refresh LC (clic droit sur Refresh) : refresh normal limite aux jeux LewdCorner,
+# sans toucher aux jeux F95zone ni a la date du dernier refresh complet
+API_LC_ONLY_PATCHES = (
+    (
+        "async def refresh(*games: Game, full=False, notifs=True, force_archived=False, force_completed=False):",
+        "async def refresh(*games: Game, full=False, notifs=True, force_archived=False, force_completed=False, lc_only=False):",
+        "signature",
+    ),
+    (
+        "                lc_queue.append(game)\n            continue\n",
+        "                lc_queue.append(game)\n            continue\n        if lc_only:\n            continue\n",
+        "file d'attente",
+    ),
+    (
+        "    notifs = notifs and globals.settings.check_notifs\n",
+        "    notifs = notifs and not lc_only and globals.settings.check_notifs\n",
+        "notifs",
+    ),
+    (
+        "    if not games:\n        globals.settings.last_successful_refresh.update(time.time())\n",
+        "    if not games and not lc_only:\n        globals.settings.last_successful_refresh.update(time.time())\n",
+        "dernier refresh",
+    ),
+)
+
+GUI_LC_REFRESH_OLD = """                if imgui.selectable(f"{icons.reload_alert} Full Refresh", False)[0]:
+                    utils.start_refresh_task(api.refresh(full=True))
+"""
+
+GUI_LC_REFRESH_NEW = """                if imgui.selectable(f"{icons.refresh} Refresh LC", False)[0]:
+                    utils.start_refresh_task(api.refresh(notifs=False, lc_only=True))
+""" + GUI_LC_REFRESH_OLD
+
 
 WINE_DISCOVER_OLD = """def discover():
     found: dict[str, pathlib.Path] = {}
@@ -1033,6 +1066,14 @@ def apply_lc_patches() -> None:
         verify_gui()
         print("Progression LewdCorner affichee en bas de fenetre (gui.py).")
 
+    gui_text = gui.read_text(encoding="utf-8")
+    if "lc_only=True" not in gui_text:
+        if GUI_LC_REFRESH_OLD not in gui_text:
+            raise SystemExit("gui.py a change : patch Refresh LC impossible.")
+        gui.write_text(gui_text.replace(GUI_LC_REFRESH_OLD, GUI_LC_REFRESH_NEW, 1), encoding="utf-8")
+        verify_gui()
+        print("Refresh LC ajoute au clic droit sur Refresh (gui.py).")
+
     api_module = SRC / "modules" / "api.py"
     api_original = api_module.read_text(encoding="utf-8")
     api_text = api_original
@@ -1047,6 +1088,11 @@ def apply_lc_patches() -> None:
         )
         if count != 1:
             raise SystemExit("api.py a change : patch suivi des mises a jour LewdCorner impossible.")
+    if "lc_only" not in api_text:
+        for old, new, label in API_LC_ONLY_PATCHES:
+            if api_text.count(old) != 1:
+                raise SystemExit(f"api.py a change : patch Refresh LC impossible ({label}).")
+            api_text = api_text.replace(old, new, 1)
     if api_text != api_original:
         api_module.write_text(api_text, encoding="utf-8")
         import py_compile
