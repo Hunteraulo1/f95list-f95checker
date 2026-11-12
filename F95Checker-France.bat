@@ -1156,6 +1156,274 @@ def apply_lc_patches() -> None:
         print("Extensions navigateur (chrome.zip / firefox.zip) mises a jour pour LewdCorner.")
 
 
+DDL_STRUCTS_OLD = """    total: int = None
+
+    class State(enum.IntEnum):"""
+
+DDL_STRUCTS_NEW = """    total: int = None
+    game_id: int = None
+
+    class State(enum.IntEnum):"""
+
+DDL_CALL_OLD = """download = FileDownload(file.filename, total=file.size, checksum=("sha1", file.sha1))"""
+
+DDL_CALL_NEW = """download = FileDownload(file.filename, total=file.size, checksum=("sha1", file.sha1), game_id=game.id)"""
+
+DDL_EXTRACT_OLD = """            download.extracted = download.path.with_suffix("")
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                shutil.unpack_archive,
+                download.path,
+                download.extracted,
+                archive_format,
+            )"""
+
+DDL_EXTRACT_NEW = """            download.extracted = await asyncio.get_event_loop().run_in_executor(
+                None,
+                smart_extract,
+                download.path,
+                archive_format,
+            )
+            try:
+                await auto_add_executables(download)
+            except Exception:
+                pass  # Never fail a successful download because of exe detection"""
+
+DDL_DOWNLOAD_ANCHOR = "async def download_file(download: FileDownload):"
+
+DDL_HELPERS = r'''_extract_junk_names = {"__macosx", ".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def _archive_stem(archive: pathlib.Path) -> str:
+    # Strip the full archive extension (handles .tar.gz, .tar.bz2, ...)
+    name = archive.name
+    lower = name.lower()
+    for _, extensions, _ in shutil.get_unpack_formats():
+        for ext in sorted(extensions, key=len, reverse=True):
+            if lower.endswith(ext) and len(name) > len(ext):
+                return name[:-len(ext)].rstrip(" .") or name
+    return archive.stem
+
+
+def _merge_move(src: pathlib.Path, dst: pathlib.Path):
+    # Move src into dst, merging directories and overwriting files
+    if src.is_dir() and not src.is_symlink() and dst.is_dir() and not dst.is_symlink():
+        for child in list(src.iterdir()):
+            _merge_move(child, dst / child.name)
+        src.rmdir()
+        return
+    if dst.is_symlink() or dst.is_file():
+        dst.unlink()
+    elif dst.is_dir():
+        shutil.rmtree(dst)
+    shutil.move(str(src), str(dst))
+
+
+def smart_extract(archive: pathlib.Path, archive_format: str) -> pathlib.Path:
+    """
+    Extract archive next to itself into a folder named after the archive,
+    without the redundant "Game/Game/..." nesting: if the archive only contains
+    a single wrapper folder (ignoring OS junk like __MACOSX), its contents are
+    used directly. Returns the final extracted folder.
+    """
+    archive = pathlib.Path(archive)
+    target = archive.parent / _archive_stem(archive)
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix=".extracting-", dir=archive.parent))
+    try:
+        shutil.unpack_archive(archive, tmp, archive_format)
+
+        # Remove OS junk at the top level
+        for child in list(tmp.iterdir()):
+            if child.name.lower() in _extract_junk_names:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+
+        # Descend through single-folder wrappers (Game/Game-1.0-pc/...)
+        root = tmp
+        while True:
+            children = [c for c in root.iterdir() if c.name.lower() not in _extract_junk_names]
+            if (
+                len(children) == 1
+                and children[0].is_dir()
+                and not children[0].is_symlink()
+                and children[0].suffix.lower() != ".app"  # Keep macOS app bundles intact
+            ):
+                root = children[0]
+            else:
+                break
+
+        if not target.exists():
+            root.rename(target)
+        else:
+            # Re-extract / update over an existing folder: merge contents
+            target.mkdir(parents=True, exist_ok=True)
+            for child in list(root.iterdir()):
+                _merge_move(child, target / child.name)
+        return target
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Executables shipped alongside games that are never the game itself
+_exe_blacklist = re.compile(
+    r"^(?:"
+    r"unitycrashhandler.*|unins\d*|uninstall.*|setup|vc_?redist.*|vcredist.*|dxsetup|dxwebsetup|oalinst|"
+    r"directx.*|dotnet.*|ndp\d+.*|physx.*|xnafx.*|"
+    r"python[w\d.]*|pythonw|zsync.*|ffmpeg|ffprobe|ffplay|7z.*|unrar|"
+    r"notification_helper|nwjc|payload|crashpad_handler|createdump|chromedriver|"
+    r"qtwebengineprocess|cefsharp\..*|.*crashreport.*|.*crash_?handler.*|"
+    r"renpy|lib|rpatool|unrpyc|un\.rpyc"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _norm_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def find_game_executables(folder: pathlib.Path, game_name: str = "") -> list[pathlib.Path]:
+    """
+    Find the most likely launcher(s) for the current OS in an extracted game folder.
+    Returns the best candidates (several only when they are equally likely).
+    """
+    if globals.os is Os.Windows:
+        def is_candidate(p: pathlib.Path):
+            return p.is_file() and p.suffix.lower() == ".exe"
+    elif globals.os is Os.MacOS:
+        def is_candidate(p: pathlib.Path):
+            return p.is_dir() and p.suffix.lower() == ".app"
+    else:
+        def is_candidate(p: pathlib.Path):
+            return p.is_file() and (
+                p.suffix.lower() in (".sh", ".x86_64", ".x86", ".appimage")
+                or (not p.suffix and os.access(p, os.X_OK))
+            )
+
+    game_key = _norm_name(game_name)
+    folder_key = _norm_name(folder.name)
+    best: list[pathlib.Path] = []
+    best_score = None
+    # Look at the root first, only go deeper if nothing usable is found there
+    dirs = [folder]
+    for depth in range(3):
+        candidates = []
+        for d in dirs:
+            try:
+                candidates.extend(c for c in d.iterdir() if is_candidate(c))
+            except OSError:
+                pass
+        candidates = [c for c in candidates if not _exe_blacklist.match(c.stem)]
+        for exe in candidates:
+            stem = exe.stem
+            key = _norm_name(stem)
+            siblings = {s.name.lower() for s in exe.parent.iterdir()}
+            score = 0
+            if f"{stem.lower()}.py" in siblings and "renpy" in siblings:
+                score += 100  # Ren'Py launcher
+            if f"{stem.lower()}_data" in siblings:
+                score += 100  # Unity player
+            if "package.nw" in siblings or "www" in siblings:
+                score += 20  # RPG Maker MV/MZ / NW.js
+            if game_key and key and (key in game_key or game_key in key):
+                score += 30
+            if folder_key and key and key in folder_key:
+                score += 10
+            if re.search(r"(?:-32|32bit|x86|_32)$", stem, re.IGNORECASE):
+                score -= 15  # Prefer 64 bit builds
+            if re.search(r"config|settings|launcher|editor|server|patch|update|mod", stem, re.IGNORECASE):
+                score -= 10
+            score -= depth * 5
+            if best_score is None or score > best_score:
+                best, best_score = [exe], score
+            elif score == best_score:
+                best.append(exe)
+        if best:
+            break
+        next_dirs = []
+        for d in dirs:
+            try:
+                next_dirs.extend(
+                    c for c in d.iterdir()
+                    if c.is_dir() and not c.is_symlink() and c.suffix.lower() != ".app"
+                    and c.name.lower() not in ("renpy", "lib", "game", "www", "__macosx")
+                    and not c.name.lower().endswith("_data")
+                )
+            except OSError:
+                pass
+        dirs = next_dirs
+    # Too many equally likely candidates means we can't tell, let the user pick
+    if len(best) > 3:
+        return []
+    return sorted(best)
+
+
+async def auto_add_executables(download: FileDownload):
+    if not download.extracted or download.game_id is None:
+        return
+    game = globals.games.get(download.game_id)
+    if not game:
+        return
+    exes = await asyncio.get_event_loop().run_in_executor(
+        None, find_game_executables, download.extracted, game.name
+    )
+    if not exes:
+        return
+
+    # Drop executables of previous versions downloaded in the same game folder
+    downloads_root = download.path.parent.resolve()
+    base = globals.settings.default_exe_dir.get(globals.os)
+    for executable in list(game.executables):
+        if utils.is_uri(executable):
+            continue
+        exe = pathlib.Path(executable)
+        if not exe.is_absolute() and base:
+            exe = pathlib.Path(base) / exe
+        try:
+            exe = exe.resolve()
+        except OSError:
+            continue
+        if downloads_root in exe.parents and download.extracted.resolve() not in exe.parents:
+            game.remove_executable(executable)
+
+    for exe in exes:
+        game.add_executable(str(exe))
+
+
+'''
+
+
+def apply_ddl_patches() -> None:
+    """Donor DDL : extraction sans dossier en double + ajout automatique de l'exe au jeu.
+    Optionnel : si l'amont a change, on previent sans bloquer le lancement."""
+    structs_module = SRC / "common" / "structs.py"
+    api_module = SRC / "modules" / "api.py"
+    structs_text = structs_module.read_text(encoding="utf-8")
+    api_text = api_module.read_text(encoding="utf-8")
+    if "def smart_extract(" in api_text and "game_id: int = None" in structs_text:
+        return
+    if (
+        structs_text.count(DDL_STRUCTS_OLD) != 1
+        or api_text.count(DDL_CALL_OLD) != 1
+        or api_text.count(DDL_EXTRACT_OLD) != 1
+        or api_text.count(DDL_DOWNLOAD_ANCHOR) != 1
+    ):
+        print("ATTENTION : api.py/structs.py a change, patch extraction Donor DDL impossible.")
+        return
+    structs_text = structs_text.replace(DDL_STRUCTS_OLD, DDL_STRUCTS_NEW, 1)
+    api_text = api_text.replace(DDL_CALL_OLD, DDL_CALL_NEW, 1)
+    api_text = api_text.replace(DDL_EXTRACT_OLD, DDL_EXTRACT_NEW, 1)
+    api_text = api_text.replace(DDL_DOWNLOAD_ANCHOR, DDL_HELPERS + DDL_DOWNLOAD_ANCHOR, 1)
+    structs_module.write_text(structs_text, encoding="utf-8")
+    api_module.write_text(api_text, encoding="utf-8")
+    import py_compile
+    py_compile.compile(str(structs_module), doraise=True)
+    py_compile.compile(str(api_module), doraise=True)
+    print("Extraction Donor DDL intelligente + ajout auto de l'exe (api.py, structs.py).")
+
+
 def apply_patches() -> None:
     shutil.copy2(PATCH_DIR / "france_labels.py", SRC / "modules" / "france_labels.py")
     print("Module france_labels.py installe.")
@@ -1225,6 +1493,7 @@ def apply_patches() -> None:
             import py_compile
             py_compile.compile(str(meta_module), doraise=True)
             print("Commit F95Checker-src affiche a la place du numero de build (meta.py).")
+    apply_ddl_patches()
     apply_lc_patches()
 
 
