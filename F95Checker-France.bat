@@ -1228,6 +1228,13 @@ DDL_EXTRACT_NEW = """            download.extracted = await asyncio.get_event_lo
             except Exception:
                 pass  # Never fail a successful download because of exe detection"""
 
+DDL_SUBDIR_OLD = "game_subdir = utils.clean_str(game.name)[:32]"
+
+DDL_SUBDIR_NEW = (
+    "from modules import france_labels\n"
+    "                            game_subdir = france_labels.game_folder_name(game)  # Nom distinct si 2 jeux s'appellent pareil"
+)
+
 DDL_DELETE_ARCHIVE_OLD = """                await auto_add_executables(download)
             except Exception:
                 pass  # Never fail a successful download because of exe detection"""
@@ -1477,7 +1484,22 @@ def apply_ddl_patches() -> None:
     _apply_ddl_delete_archive_patch(api_module, api_text)
 
 
+def _apply_ddl_subdir_patch(api_module: Path, api_text: str) -> str:
+    if "france_labels.game_folder_name" in api_text:
+        return api_text
+    if api_text.count(DDL_SUBDIR_OLD) != 1:
+        print("ATTENTION : api.py a change, nom de dossier Donor DDL distinct impossible.")
+        return api_text
+    api_text = api_text.replace(DDL_SUBDIR_OLD, DDL_SUBDIR_NEW, 1)
+    api_module.write_text(api_text, encoding="utf-8")
+    import py_compile
+    py_compile.compile(str(api_module), doraise=True)
+    print("Donor DDL : nom de dossier distinct pour les jeux homonymes (api.py).")
+    return api_text
+
+
 def _apply_ddl_delete_archive_patch(api_module: Path, api_text: str) -> None:
+    api_text = _apply_ddl_subdir_patch(api_module, api_text)
     if "game_delete_archive" in api_text:
         return
     if api_text.count(DDL_DELETE_ARCHIVE_OLD) != 1:
@@ -3049,6 +3071,43 @@ def _reorg_container_name(game) -> str:
     return utils.clean_str(game.name)[:32].rstrip()
 
 
+def _occupies(game, folder: str, base: Path | None) -> bool:
+    """Vrai si un exe du jeu est deja range dans <base>/<folder>/<sous-dossier>/..."""
+    if base is None:
+        return False
+    for exe in game.executables:
+        parts = _rel_exe_parts(exe, base)
+        if parts and len(parts) >= 3 and parts[0].lower() == folder.lower():
+            return True
+    return False
+
+
+def game_folder_name(game, games=None, base: Path | None = None) -> str:
+    """Nom du dossier d'un jeu : son nom nettoye (comme le Donor DDL).
+    Si un AUTRE jeu donne le meme nom, un seul garde le nom simple (celui deja range la,
+    sinon le plus petit id) ; l'autre recoit son developpeur, ou l'id du thread."""
+    from modules import globals, utils
+    clean = _reorg_container_name(game)
+    if not clean:
+        return clean
+    if games is None:
+        games = list(globals.games.values())
+    if base is None:
+        base = _reorg_base()
+    rivals = [g for g in games if g.id != game.id and _reorg_container_name(g).lower() == clean.lower()]
+    if not rivals:
+        return clean
+    occupants = [g for g in [game, *rivals] if _occupies(g, clean, base)]
+    owner = occupants[0] if len(occupants) == 1 else min([game, *rivals], key=lambda g: g.id)
+    if owner.id == game.id:
+        return clean
+    dev = utils.clean_str(getattr(game, "developer", "") or "")[:32].strip()
+    rival_devs = {utils.clean_str(getattr(g, "developer", "") or "").lower() for g in rivals}
+    if dev and dev.lower() not in rival_devs:
+        return f"{clean} ({dev})"
+    return f"{clean} [{game.id}]"
+
+
 def _rel_exe_parts(exe: str, base: Path) -> tuple[str, ...] | None:
     p = Path(exe)
     if p.is_absolute():
@@ -3108,6 +3167,9 @@ def _plan_reorganize(base: Path, games: list) -> dict:
             info["games"][game.id] = game
             info["depths"].append(len(parts))
 
+    name_groups: dict[str, list] = {}  # nom nettoye (minuscules) -> jeux qui le partagent
+    for game in games:
+        name_groups.setdefault(_reorg_container_name(game).lower(), []).append(game)
     tops_lower = {t.lower() for t in by_top}
     moves: list[dict] = []
     conflicts: list[dict] = []  # Dossiers de jeux non rangeables : deplacables dans ___CONFLICTS___
@@ -3140,7 +3202,7 @@ def _plan_reorganize(base: Path, games: list) -> dict:
             conflict(top, info, f"dossier partage par plusieurs jeux ({names})")
             continue
         game = next(iter(info["games"].values()))
-        clean = _reorg_container_name(game)
+        clean = game_folder_name(game, name_groups.get(_reorg_container_name(game).lower(), [game]), base)
         if not clean:
             conflict(top, info, f"nom de jeu vide une fois nettoye ({game.name})")
             continue
