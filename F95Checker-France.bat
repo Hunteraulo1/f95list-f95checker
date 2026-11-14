@@ -3267,12 +3267,12 @@ async def reorganize_preview() -> None:
         details.append(f"A RANGER ({len(moves)})")
         details += [f"  {m['old']}  ->  {m['new']}" for m in moves]
     if skipped:
-        details.append(f"\nNON RANGES ({len(skipped)})")
+        details.append(f"\nIGNORES ({len(skipped)})")
         details += [f"  {label}  :  {reason}" for label, reason in skipped]
     text = (
         f"Dossier des jeux : {base}\n\n"
         f"{len(moves)} dossier(s) a ranger dans <Nom du jeu>/<dossier actuel>.\n"
-        f"{plan['already']} deja range(s), {len(skipped)} non range(s) (voir le detail)."
+        f"{plan['already']} deja range(s), {len(skipped)} dossier(s) ignore(s) (voir le detail)."
     )
     if not moves:
         _reorg_msg(text + "\n\nRien a ranger.", MsgBox.info, more="\n".join(details) or None)
