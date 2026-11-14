@@ -288,6 +288,9 @@ GUI_TR_CLEANUP_NEW = GUI_TR_CLEANUP_NEW[:-len("\n            ):")] + """
                  "son extraction reussie (option \\"Extract downloads\\" activee)."),
             ):""" + GUI_TR_CLEANUP_LOOP_BODY
 
+GUI_REORG_NEW = GUI_TR_CLEANUP_NEW + """
+            france_labels.draw_reorganize_settings(draw_settings_label, right_width)"""
+
 GUI_DDL_OPEN_OLD = """                    if not errored:
                         if imgui.button(icons.open_in_app):
                             async_thread.run(callbacks.default_open(download.path))"""
@@ -1554,6 +1557,11 @@ def apply_patches() -> None:
         else:
             raise SystemExit("gui.py a change : patch reglages de nettoyage impossible.")
         print("Reglages de nettoyage des archives ajoutes (gui.py).")
+    if "draw_reorganize_settings" not in text:
+        if GUI_TR_CLEANUP_NEW not in text:
+            raise SystemExit("gui.py a change : patch rangement des dossiers impossible.")
+        text = text.replace(GUI_TR_CLEANUP_NEW, GUI_REORG_NEW, 1)
+        print("Bouton de rangement des dossiers de jeux ajoute (gui.py).")
     if "archive peut-etre supprimee" not in text:
         if GUI_DDL_OPEN_OLD in text:
             text = text.replace(GUI_DDL_OPEN_OLD, GUI_DDL_OPEN_NEW, 1)
@@ -3010,6 +3018,358 @@ def globals_reset_error() -> None:
     global _tr_error, _tr_loaded_at
     _tr_error = ""
     _tr_loaded_at = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Rangement des dossiers de jeux : <dossier des jeux>/<Nom du jeu>/<dossier actuel>
+# (meme convention que les telechargements Donor DDL)
+# ---------------------------------------------------------------------------
+
+_reorg_busy = False
+_reorg_journal: Path | None | bool = False  # False = pas encore cherche
+
+
+def _reorg_journal_dir() -> Path:
+    return _config_paths()[0].parent
+
+
+def _last_reorg_journal() -> Path | None:
+    global _reorg_journal
+    if _reorg_journal is False:
+        files = sorted(
+            p for p in _reorg_journal_dir().glob("rangement-*.json") if not p.name.endswith(".annule.json")
+        ) if _reorg_journal_dir().is_dir() else []
+        _reorg_journal = files[-1] if files else None
+    return _reorg_journal
+
+
+def _reorg_container_name(game) -> str:
+    from modules import utils
+    # Comme le Donor DDL (clean_str()[:32]) ; Windows retire de toute facon les espaces finaux
+    return utils.clean_str(game.name)[:32].rstrip()
+
+
+def _rel_exe_parts(exe: str, base: Path) -> tuple[str, ...] | None:
+    p = Path(exe)
+    if p.is_absolute():
+        try:
+            p = p.relative_to(base)
+        except ValueError:
+            return None
+    return p.parts
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _plan_reorganize(base: Path, games: list) -> dict:
+    from modules import utils
+    skipped: list[tuple[str, str]] = []
+    by_top: dict[str, dict] = {}  # dossier de 1er niveau -> {game_ids, depths}
+    for game in games:
+        for exe in game.executables:
+            if utils.is_uri(exe):
+                continue
+            parts = _rel_exe_parts(exe, base)
+            if parts is None:
+                skipped.append((f"{game.name} : {exe}", "hors du dossier des jeux, ignore"))
+                continue
+            if len(parts) < 2:
+                skipped.append((f"{game.name} : {exe}", "exe directement a la racine du dossier des jeux"))
+                continue
+            if not (base.joinpath(*parts)).exists():
+                skipped.append((f"{game.name} : {exe}", "exe introuvable"))
+                continue
+            info = by_top.setdefault(parts[0], {"games": {}, "depths": []})
+            info["games"][game.id] = game
+            info["depths"].append(len(parts))
+
+    tops_lower = {t.lower() for t in by_top}
+    moves: list[dict] = []
+    already = 0
+    containers: dict[str, int] = {}  # nom de dossier (minuscules) -> id du jeu qui l'utilise
+    for top, info in sorted(by_top.items(), key=lambda kv: kv[0].lower()):
+        if len(info["games"]) > 1:
+            names = ", ".join(sorted(g.name for g in info["games"].values()))
+            skipped.append((top, f"dossier partage par plusieurs jeux ({names})"))
+            continue
+        game = next(iter(info["games"].values()))
+        clean = _reorg_container_name(game)
+        if not clean:
+            skipped.append((top, f"nom de jeu vide une fois nettoye ({game.name})"))
+            continue
+        nested = [d >= 3 for d in info["depths"]]
+        if top == clean and all(nested):
+            already += 1
+            containers[clean.lower()] = game.id
+            continue
+        if top == clean and any(nested):
+            skipped.append((top, "structure mixte (exes a plusieurs niveaux)"))
+            continue
+        owner = containers.get(clean.lower())
+        if owner is not None and owner != game.id:
+            skipped.append((top, f"un autre jeu utilise deja le dossier \"{clean}\""))
+            continue
+        container = base / clean
+        in_place = top == clean or _same_dir(container, base / top)
+        if not in_place and container.exists():
+            if not container.is_dir():
+                skipped.append((top, f"\"{clean}\" existe deja et n'est pas un dossier"))
+                continue
+            other = by_top.get(clean) or next((v for k, v in by_top.items() if k.lower() == clean.lower()), None)
+            if other is not None and (set(other["games"]) != {game.id} or not all(d >= 3 for d in other["depths"])):
+                skipped.append((top, f"le dossier \"{clean}\" existe deja et appartient a un autre jeu"))
+                continue
+            if other is None and owner is None and any(c.is_file() for c in container.iterdir()):
+                skipped.append((top, f"le dossier \"{clean}\" existe deja (contenu non reconnu)"))
+                continue
+        if (container / top).exists() and not in_place:
+            skipped.append((top, f"\"{clean}/{top}\" existe deja"))
+            continue
+        containers[clean.lower()] = game.id
+        moves.append({"game_id": game.id, "game": game.name, "old": top, "new": f"{clean}/{top}"})
+
+    planned = set(containers)
+    for d in sorted(base.iterdir(), key=lambda p: p.name.lower()) if base.is_dir() else []:
+        if d.is_dir() and not d.name.startswith(".") and d.name.lower() not in tops_lower and d.name.lower() not in planned:
+            skipped.append((d.name, "aucun jeu de F95Checker ne pointe dessus"))
+    return {"moves": moves, "skipped": skipped, "already": already}
+
+
+def _move_dir(base: Path, old: str, new: str) -> None:
+    """Deplace base/old vers base/new (new = <conteneur>/<nom>), y compris quand le conteneur est old lui-meme."""
+    import time
+    src, dst = base.joinpath(*Path(old).parts), base.joinpath(*Path(new).parts)
+    container = dst.parent
+    if not src.is_dir():
+        raise OSError(f"dossier introuvable : {src}")
+    if container == base:
+        # Annulation : on sort le dossier de son conteneur
+        old_container = src.parent
+        if _same_dir(dst, old_container):  # Le dossier portait le nom du conteneur
+            tmp = base / f".rangement-{int(time.time() * 1000)}"
+            src.rename(tmp)
+            try:
+                old_container.rmdir()
+            except OSError:
+                tmp.rename(src)
+                raise
+            tmp.rename(dst)
+            return
+        if dst.exists():
+            raise OSError(f"la cible existe deja : {dst}")
+        src.rename(dst)
+        try:
+            old_container.rmdir()  # Conteneur vide : on le retire
+        except OSError:
+            pass
+        return
+    if _same_dir(container, src):
+        # Le dossier porte deja le nom du conteneur : on passe par un nom temporaire
+        tmp = base / f".rangement-{int(time.time() * 1000)}"
+        src.rename(tmp)
+        try:
+            container.mkdir()
+            tmp.rename(dst)
+        except OSError:
+            try:
+                container.rmdir()
+            except OSError:
+                pass
+            tmp.rename(src)
+            raise
+        return
+    if dst.exists():
+        raise OSError(f"la cible existe deja : {dst}")
+    created = not container.exists()
+    container.mkdir(exist_ok=True)
+    try:
+        src.rename(dst)
+    except OSError:
+        if created:
+            try:
+                container.rmdir()
+            except OSError:
+                pass
+        raise
+
+
+def _execute_moves(base: Path, moves: list[dict], reverse: bool = False) -> tuple[list[dict], list[str]]:
+    done, errors = [], []
+    for m in (reversed(moves) if reverse else moves):
+        old, new = (m["new"], m["old"]) if reverse else (m["old"], m["new"])
+        try:
+            _move_dir(base, old, new)
+            done.append(m)
+        except OSError as exc:
+            errors.append(f"{old} : {exc}")
+    return done, errors
+
+
+async def _rebase_executables(base: Path, moves: list[dict], reverse: bool = False) -> None:
+    from modules import db, globals, utils
+    for m in moves:
+        game = globals.games.get(m["game_id"])
+        if game is None:
+            continue
+        old, new = (m["new"], m["old"]) if reverse else (m["old"], m["new"])
+        old_parts = Path(old).parts
+        changed = False
+        for i, exe in enumerate(game.executables):
+            if utils.is_uri(exe):
+                continue
+            parts = _rel_exe_parts(exe, base)
+            if parts and tuple(p.lower() for p in parts[:len(old_parts)]) == tuple(p.lower() for p in old_parts):
+                game.executables[i] = Path(new, *parts[len(old_parts):]).as_posix()
+                changed = True
+        if changed:
+            await db.update_game(game, "executables")
+            game.validate_executables()
+
+
+def _reorg_msg(text: str, level=None, buttons=True, more: str = None) -> None:
+    from common.structs import MsgBox
+    from modules import msgbox, utils
+    utils.push_popup(msgbox.msgbox, "Rangement des jeux", text, level or MsgBox.info, buttons, more=more)
+
+
+def _reorg_base() -> Path | None:
+    from modules import globals
+    base = globals.settings.default_exe_dir.get(globals.os)
+    return Path(base) if base else None
+
+
+async def reorganize_preview() -> None:
+    global _reorg_busy
+    from common.structs import MsgBox
+    from external import async_thread
+    from modules import globals, icons
+
+    base = _reorg_base()
+    if base is None or not base.is_dir():
+        _reorg_msg("Definis d'abord le dossier par defaut des exes (Settings > Executables).", MsgBox.warn)
+        return
+    _reorg_busy = True
+    try:
+        plan = await asyncio.get_event_loop().run_in_executor(None, _plan_reorganize, base, list(globals.games.values()))
+    except Exception as exc:
+        _reorg_msg(f"Analyse impossible :\n{exc}", MsgBox.error)
+        return
+    finally:
+        _reorg_busy = False
+    moves, skipped = plan["moves"], plan["skipped"]
+    details = []
+    if moves:
+        details.append(f"A RANGER ({len(moves)})")
+        details += [f"  {m['old']}  ->  {m['new']}" for m in moves]
+    if skipped:
+        details.append(f"\nNON RANGES ({len(skipped)})")
+        details += [f"  {label}  :  {reason}" for label, reason in skipped]
+    text = (
+        f"Dossier des jeux : {base}\n\n"
+        f"{len(moves)} dossier(s) a ranger dans <Nom du jeu>/<dossier actuel>.\n"
+        f"{plan['already']} deja range(s), {len(skipped)} non range(s) (voir le detail)."
+    )
+    if not moves:
+        _reorg_msg(text + "\n\nRien a ranger.", MsgBox.info, more="\n".join(details) or None)
+        return
+    _reorg_msg(
+        text + "\n\nLes chemins des exes seront mis a jour. Un journal permet d'annuler.\n"
+        "Ferme les jeux en cours avant de continuer.",
+        MsgBox.info,
+        {
+            f"{icons.check} Ranger": lambda: async_thread.run(_reorganize_apply(base, moves)),
+            f"{icons.cancel} Annuler": None,
+        },
+        more="\n".join(details),
+    )
+
+
+async def _reorganize_apply(base: Path, moves: list[dict]) -> None:
+    global _reorg_busy, _reorg_journal
+    import time
+    from common.structs import MsgBox
+    _reorg_busy = True
+    try:
+        done, errors = await asyncio.get_event_loop().run_in_executor(None, _execute_moves, base, moves)
+        if done:
+            journal = _reorg_journal_dir() / f"rangement-{time.strftime('%Y%m%d-%H%M%S')}.json"
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            journal.write_text(json.dumps({"base": str(base), "moves": done}, indent=1, ensure_ascii=False), encoding="utf-8")
+            _reorg_journal = journal
+            await _rebase_executables(base, done)
+    finally:
+        _reorg_busy = False
+    text = f"{len(done)} dossier(s) range(s)."
+    if errors:
+        text += f"\n{len(errors)} echec(s) (jeu ouvert, fichier verrouille...) : voir le detail."
+    _reorg_msg(text, MsgBox.warn if errors else MsgBox.info, more="\n".join(errors) or None)
+
+
+async def reorganize_undo() -> None:
+    global _reorg_busy, _reorg_journal
+    from common.structs import MsgBox
+    journal = _last_reorg_journal()
+    base = _reorg_base()
+    if journal is None or base is None:
+        return
+    _reorg_busy = True
+    try:
+        moves = json.loads(journal.read_text(encoding="utf-8"))["moves"]
+        done, errors = await asyncio.get_event_loop().run_in_executor(None, _execute_moves, base, moves, True)
+        await _rebase_executables(base, done, reverse=True)
+        if not errors:
+            journal.rename(journal.with_name(journal.stem + ".annule.json"))
+            _reorg_journal = False
+    except Exception as exc:
+        _reorg_msg(f"Annulation impossible :\n{exc}", MsgBox.error)
+        return
+    finally:
+        _reorg_busy = False
+    text = f"{len(done)} dossier(s) remis a leur place."
+    if errors:
+        text += f"\n{len(errors)} echec(s) : voir le detail. Le journal est conserve."
+    _reorg_msg(text, MsgBox.warn if errors else MsgBox.info, more="\n".join(errors) or None)
+
+
+def draw_reorganize_settings(draw_settings_label, right_width) -> None:
+    import imgui
+    from common.structs import MsgBox
+    from external import async_thread
+    from modules import icons
+
+    draw_settings_label(
+        "Ranger les dossiers de jeux",
+        "Range chaque jeu dans <dossier des jeux>/<Nom du jeu>/<dossier actuel>,\n"
+        "comme les telechargements Donor DDL, et met a jour les chemins des exes.\n"
+        "Un apercu s'affiche avant tout deplacement.",
+    )
+    if _reorg_busy:
+        imgui.push_disabled()
+    if imgui.button("Apercu###fr_reorg_preview", width=right_width):
+        async_thread.run(reorganize_preview())
+    if _reorg_busy:
+        imgui.pop_disabled()
+    journal = _last_reorg_journal()
+    if journal is not None:
+        draw_settings_label("Annuler le dernier rangement", f"Journal : {journal}")
+        if _reorg_busy:
+            imgui.push_disabled()
+        if imgui.button("Annuler###fr_reorg_undo", width=right_width):
+            _reorg_msg(
+                "Remettre les dossiers du dernier rangement a leur place d'origine ?",
+                MsgBox.warn,
+                {
+                    f"{icons.check} Annuler le rangement": lambda: async_thread.run(reorganize_undo()),
+                    f"{icons.cancel} Fermer": None,
+                },
+            )
+        if _reorg_busy:
+            imgui.pop_disabled()
 
 @@END_FRANCE_LABELS@@
 @@BEGIN_FRANCE_ICON@@
