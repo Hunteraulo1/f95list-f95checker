@@ -260,6 +260,24 @@ GUI_UPDATE_CHECK_NEW = GUI_UPDATE_CHECK_OLD + """
             if france_labels.last_update_result():
                 draw_settings_label(france_labels.last_update_result())"""
 
+GUI_TR_CLEANUP_OLD = """            if france_labels.last_update_result():
+                draw_settings_label(france_labels.last_update_result())"""
+
+GUI_TR_CLEANUP_NEW = GUI_TR_CLEANUP_OLD + """
+            for tr_key, tr_label, tr_tip in (
+                ("tr_delete_archive", "Traductions : supprimer l'archive",
+                 "Supprime le .zip / .rar telecharge une fois la traduction installee.\\n"
+                 "Garde-la si tu veux pouvoir reinstaller la traduction apres une mise a jour du jeu."),
+                ("tr_delete_extracted", "Traductions : supprimer le dossier decompresse",
+                 "Supprime le dossier decompresse une fois la traduction installee\\n"
+                 "(les fichiers sont deja copies dans le jeu)."),
+            ):
+                draw_settings_label(tr_label, tr_tip)
+                imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + checkbox_offset)
+                tr_changed, tr_value = imgui.checkbox(f"###{tr_key}", france_labels.tr_cleanup_setting(tr_key))
+                if tr_changed:
+                    france_labels.set_tr_cleanup_setting(tr_key, tr_value)"""
+
 GUI_ANCHOR = """            imgui.end_table()
             imgui.spacing()
 
@@ -1484,6 +1502,11 @@ def apply_patches() -> None:
             raise SystemExit("gui.py a change : patch bouton mises a jour impossible.")
         text = text.replace(GUI_UPDATE_CHECK_OLD, GUI_UPDATE_CHECK_NEW, 1)
         print("Bouton de verification des mises a jour ajoute (gui.py).")
+    if "tr_cleanup_setting" not in text:
+        if GUI_TR_CLEANUP_OLD not in text:
+            raise SystemExit("gui.py a change : patch reglages des traductions impossible.")
+        text = text.replace(GUI_TR_CLEANUP_OLD, GUI_TR_CLEANUP_NEW, 1)
+        print("Reglages de nettoyage des traductions ajoutes (gui.py).")
     if "france_labels," not in text:
         if GUI_IMPORT_OLD not in text:
             raise SystemExit("Import france_labels impossible dans gui.py.")
@@ -1543,12 +1566,16 @@ def migrate_ini() -> None:
 def write_ini(api_key: str) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cfg = configparser.ConfigParser()
-    cfg["france"] = {
+    if INI.is_file():
+        cfg.read(INI, encoding="utf-8")  # Garde les autres reglages (nettoyage des traductions...)
+    if not cfg.has_section("france"):
+        cfg.add_section("france")
+    cfg["france"].update({
         "api_key": api_key.strip(),
-        "auth_mode": "bearer",
-        "api_url": "https://f95france.site/api/games",
-        "ignore_ids": "71058",
-    }
+        "auth_mode": cfg["france"].get("auth_mode", "bearer"),
+        "api_url": cfg["france"].get("api_url", "https://f95france.site/api/games"),
+        "ignore_ids": cfg["france"].get("ignore_ids", "71058"),
+    })
     with INI.open("w", encoding="utf-8") as f:
         cfg.write(f)
     print(f"Config : {INI}")
@@ -1741,6 +1768,33 @@ def load_config() -> configparser.ConfigParser:
             cfg.read(path, encoding="utf-8")
             break
     return cfg
+
+
+_TR_CLEANUP_KEYS = ("tr_delete_archive", "tr_delete_extracted")
+_tr_cleanup_cache: dict[str, bool] | None = None
+
+
+def tr_cleanup_setting(key: str) -> bool:
+    global _tr_cleanup_cache
+    if _tr_cleanup_cache is None:
+        section = load_config()["france"]
+        _tr_cleanup_cache = {k: section.getboolean(k, fallback=False) for k in _TR_CLEANUP_KEYS}
+    return _tr_cleanup_cache.get(key, False)
+
+
+def set_tr_cleanup_setting(key: str, value: bool) -> None:
+    tr_cleanup_setting(key)
+    _tr_cleanup_cache[key] = bool(value)
+    path = _config_paths()[0]
+    cfg = configparser.ConfigParser()
+    if path.is_file():
+        cfg.read(path, encoding="utf-8")
+    if not cfg.has_section("france"):
+        cfg.add_section("france")
+    cfg["france"][key] = "true" if value else "false"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        cfg.write(f)
 
 
 def _parse_ignore_ids(raw: str) -> set[int]:
@@ -2447,14 +2501,49 @@ def _push_msg(text: str, level=None, buttons=True) -> None:
     utils.push_popup(msgbox.msgbox, "Traduction F95-France", text, level or MsgBox.info, buttons)
 
 
-def _offer_install(game, translation: dict, extracted: Path, mods_ok: bool = False) -> None:
+def _cleanup_translation_files(archive: Path | None, extracted: Path) -> str:
+    """Supprime l'archive et/ou le dossier decompresse selon les reglages. Renvoie un resume."""
+    done, errors = [], []
+    targets = []
+    if tr_cleanup_setting("tr_delete_extracted"):
+        targets.append(("dossier decompresse", extracted))
+    if archive is not None and archive != extracted and tr_cleanup_setting("tr_delete_archive"):
+        targets.append(("archive", archive))
+    for label, path in targets:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            else:
+                continue
+            done.append(label)
+        except OSError as exc:
+            errors.append(f"{label} : {exc}")
+    # Retire "Traduction FR" puis le dossier du jeu s'ils sont devenus vides
+    folder = extracted.parent
+    for _ in range(2):
+        try:
+            folder.rmdir()
+        except OSError:
+            break
+        folder = folder.parent
+    lines = []
+    if done:
+        lines.append("Supprime : " + ", ".join(done) + ".")
+    if errors:
+        lines.append("Suppression impossible :\n" + "\n".join(errors))
+    return "\n".join(lines)
+
+
+def _offer_install(game, translation: dict, extracted: Path, mods_ok: bool = False, archive: Path | None = None) -> None:
     from common.structs import MsgBox
     from external import async_thread
     from modules import callbacks, icons
 
     open_folder = (f"{icons.folder_open_outline} Ouvrir le dossier", lambda: async_thread.run(callbacks.default_open(str(extracted))))
     if translation.get("tname") == "translation_with_mods" and not mods_ok:
-        buttons = {f"{icons.check} Continuer": lambda: _offer_install(game, translation, extracted, mods_ok=True)}
+        buttons = {f"{icons.check} Continuer": lambda: _offer_install(game, translation, extracted, mods_ok=True, archive=archive)}
         if link := translation.get("tlink"):
             buttons[f"{icons.open_in_new} Voir la page"] = lambda: callbacks.open_webpage(link)
         buttons[open_folder[0]] = open_folder[1]
@@ -2472,7 +2561,7 @@ def _offer_install(game, translation: dict, extracted: Path, mods_ok: bool = Fal
     if game_root is None:
         def _after_exe(selected):
             if selected:
-                _offer_install(game, translation, extracted, mods_ok=True)
+                _offer_install(game, translation, extracted, mods_ok=True, archive=archive)
         _push_msg(
             f"Traduction telechargee dans :\n{extracted}\n\n"
             "Aucun executable n'est defini pour ce jeu, impossible de savoir ou l'installer.\n"
@@ -2491,9 +2580,11 @@ def _offer_install(game, translation: dict, extracted: Path, mods_ok: bool = Fal
             try:
                 loop = asyncio.get_event_loop()
                 copied = await loop.run_in_executor(None, _execute_plan, plan)
-                _push_msg(f"Traduction installee : {copied} fichier(s) copies dans\n{game_root}")
             except Exception as exc:
                 _push_msg(f"Installation impossible :\n{exc}", MsgBox.error)
+                return
+            cleaned = await loop.run_in_executor(None, _cleanup_translation_files, archive, extracted)
+            _push_msg(f"Traduction installee : {copied} fichier(s) copies dans\n{game_root}" + (f"\n\n{cleaned}" if cleaned else ""))
         async_thread.run(_run())
 
     plan = _plan_install(extracted, game_root, translation.get("gameType") == "renpy")
@@ -2564,7 +2655,7 @@ async def _finish_download(game, translation: dict, download, final: Path, mega=
         return
     finally:
         download.state = download.State.Stopped
-    _offer_install(game, translation, download.extracted)
+    _offer_install(game, translation, download.extracted, archive=download.path)
 
 
 async def _download_translation(game, translation: dict) -> None:
