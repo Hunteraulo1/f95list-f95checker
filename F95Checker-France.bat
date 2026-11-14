@@ -3059,6 +3059,25 @@ def _rel_exe_parts(exe: str, base: Path) -> tuple[str, ...] | None:
     return p.parts
 
 
+CONFLICTS_DIR = "___CONFLICTS___"
+
+
+def _self_root() -> Path:
+    # Dossier du launcher : contient F95Checker-src et ._f95_france_cache
+    return Path(__file__).resolve().parents[2]
+
+
+def _contains(folder: Path, path: Path) -> bool:
+    """Vrai si `folder` est `path` ou l'un de ses parents."""
+    try:
+        folder = folder.resolve()
+        path = path.resolve()
+    except OSError:
+        return True  # Dans le doute, on ne touche a rien
+    norm = lambda p: os.path.normcase(str(p))
+    return norm(folder) in {norm(path), *(norm(p) for p in path.parents)}
+
+
 def _same_dir(a: Path, b: Path) -> bool:
     try:
         return a.exists() and b.exists() and os.path.samefile(a, b)
@@ -3090,17 +3109,39 @@ def _plan_reorganize(base: Path, games: list) -> dict:
 
     tops_lower = {t.lower() for t in by_top}
     moves: list[dict] = []
+    conflicts: list[dict] = []  # Dossiers de jeux non rangeables : deplacables dans ___CONFLICTS___
     already = 0
     containers: dict[str, int] = {}  # nom de dossier (minuscules) -> id du jeu qui l'utilise
+    self_root = _self_root()
+
+    def conflict(top: str, info: dict, reason: str) -> None:
+        target = base / CONFLICTS_DIR / top
+        if target.exists():
+            skipped.append((top, f"{reason} ; deja present dans {CONFLICTS_DIR}"))
+            return
+        skipped.append((top, reason))
+        conflicts.append({
+            "game_ids": sorted(info["games"]),
+            "game": ", ".join(sorted(g.name for g in info["games"].values())),
+            "old": top,
+            "new": f"{CONFLICTS_DIR}/{top}",
+            "reason": reason,
+        })
+
     for top, info in sorted(by_top.items(), key=lambda kv: kv[0].lower()):
+        if top.lower() == CONFLICTS_DIR.lower():
+            continue  # Dossier des conflits : jamais range
+        if _contains(base / top, self_root):
+            skipped.append((top, "contient F95Checker, jamais deplace"))
+            continue
         if len(info["games"]) > 1:
             names = ", ".join(sorted(g.name for g in info["games"].values()))
-            skipped.append((top, f"dossier partage par plusieurs jeux ({names})"))
+            conflict(top, info, f"dossier partage par plusieurs jeux ({names})")
             continue
         game = next(iter(info["games"].values()))
         clean = _reorg_container_name(game)
         if not clean:
-            skipped.append((top, f"nom de jeu vide une fois nettoye ({game.name})"))
+            conflict(top, info, f"nom de jeu vide une fois nettoye ({game.name})")
             continue
         nested = [d >= 3 for d in info["depths"]]
         if top == clean and all(nested):
@@ -3108,36 +3149,37 @@ def _plan_reorganize(base: Path, games: list) -> dict:
             containers[clean.lower()] = game.id
             continue
         if top == clean and any(nested):
-            skipped.append((top, "structure mixte (exes a plusieurs niveaux)"))
+            conflict(top, info, "structure mixte (exes a plusieurs niveaux)")
             continue
         owner = containers.get(clean.lower())
         if owner is not None and owner != game.id:
-            skipped.append((top, f"un autre jeu utilise deja le dossier \"{clean}\""))
+            conflict(top, info, f"un autre jeu utilise deja le dossier \"{clean}\"")
             continue
         container = base / clean
         in_place = top == clean or _same_dir(container, base / top)
         if not in_place and container.exists():
             if not container.is_dir():
-                skipped.append((top, f"\"{clean}\" existe deja et n'est pas un dossier"))
+                conflict(top, info, f"\"{clean}\" existe deja et n'est pas un dossier")
                 continue
             other = by_top.get(clean) or next((v for k, v in by_top.items() if k.lower() == clean.lower()), None)
             if other is not None and (set(other["games"]) != {game.id} or not all(d >= 3 for d in other["depths"])):
-                skipped.append((top, f"le dossier \"{clean}\" existe deja et appartient a un autre jeu"))
+                conflict(top, info, f"le dossier \"{clean}\" existe deja et appartient a un autre jeu")
                 continue
-            if other is None and owner is None and any(c.is_file() for c in container.iterdir()):
-                skipped.append((top, f"le dossier \"{clean}\" existe deja (contenu non reconnu)"))
+            if other is None:
+                # Dossier sans jeu (ignore) : on ne fusionne jamais dedans
+                conflict(top, info, f"un dossier ignore porte deja le nom \"{clean}\"")
                 continue
         if (container / top).exists() and not in_place:
-            skipped.append((top, f"\"{clean}/{top}\" existe deja"))
+            conflict(top, info, f"\"{clean}/{top}\" existe deja")
             continue
         containers[clean.lower()] = game.id
         moves.append({"game_id": game.id, "game": game.name, "old": top, "new": f"{clean}/{top}"})
 
-    planned = set(containers)
+    planned = set(containers) | {CONFLICTS_DIR.lower()}
     for d in sorted(base.iterdir(), key=lambda p: p.name.lower()) if base.is_dir() else []:
         if d.is_dir() and not d.name.startswith(".") and d.name.lower() not in tops_lower and d.name.lower() not in planned:
             skipped.append((d.name, "aucun jeu de F95Checker ne pointe dessus"))
-    return {"moves": moves, "skipped": skipped, "already": already}
+    return {"moves": moves, "conflicts": conflicts, "skipped": skipped, "already": already}
 
 
 def _move_dir(base: Path, old: str, new: str) -> None:
@@ -3147,6 +3189,8 @@ def _move_dir(base: Path, old: str, new: str) -> None:
     container = dst.parent
     if not src.is_dir():
         raise OSError(f"dossier introuvable : {src}")
+    if _contains(src, _self_root()):
+        raise OSError("ce dossier contient F95Checker, il n'est jamais deplace")
     if container == base:
         # Annulation : on sort le dossier de son conteneur
         old_container = src.parent
@@ -3212,8 +3256,8 @@ def _execute_moves(base: Path, moves: list[dict], reverse: bool = False) -> tupl
 
 async def _rebase_executables(base: Path, moves: list[dict], reverse: bool = False) -> None:
     from modules import db, globals, utils
-    for m in moves:
-        game = globals.games.get(m["game_id"])
+    for m, game_id in ((m, gid) for m in moves for gid in (m.get("game_ids") or [m["game_id"]])):
+        game = globals.games.get(game_id)
         if game is None:
             continue
         old, new = (m["new"], m["old"]) if reverse else (m["old"], m["new"])
@@ -3261,30 +3305,41 @@ async def reorganize_preview() -> None:
         return
     finally:
         _reorg_busy = False
-    moves, skipped = plan["moves"], plan["skipped"]
+    moves, conflicts, skipped = plan["moves"], plan["conflicts"], plan["skipped"]
+    conflict_dirs = {c["old"] for c in conflicts}
     details = []
     if moves:
         details.append(f"A RANGER ({len(moves)})")
         details += [f"  {m['old']}  ->  {m['new']}" for m in moves]
-    if skipped:
-        details.append(f"\nIGNORES ({len(skipped)})")
-        details += [f"  {label}  :  {reason}" for label, reason in skipped]
+    if conflicts:
+        details.append(f"\nCONFLITS ({len(conflicts)}) : deplacables dans {CONFLICTS_DIR} (option)")
+        details += [f"  {c['old']}  :  {c['reason']}" for c in conflicts]
+    others = [(label, reason) for label, reason in skipped if label not in conflict_dirs]
+    if others:
+        details.append(f"\nIGNORES ({len(others)})")
+        details += [f"  {label}  :  {reason}" for label, reason in others]
     text = (
         f"Dossier des jeux : {base}\n\n"
         f"{len(moves)} dossier(s) a ranger dans <Nom du jeu>/<dossier actuel>.\n"
-        f"{plan['already']} deja range(s), {len(skipped)} dossier(s) ignore(s) (voir le detail)."
+        f"{plan['already']} deja range(s), {len(skipped)} dossier(s) ignore(s)"
+        + (f", dont {len(conflicts)} en conflit" if conflicts else "")
+        + " (voir le detail)."
     )
-    if not moves:
+    if not moves and not conflicts:
         _reorg_msg(text + "\n\nRien a ranger.", MsgBox.info, more="\n".join(details) or None)
         return
+    buttons = {}
+    if moves:
+        buttons[f"{icons.check} Ranger"] = lambda: async_thread.run(_reorganize_apply(base, moves))
+    if conflicts:
+        label = f"Ranger + conflits dans {CONFLICTS_DIR}" if moves else f"Deplacer les conflits dans {CONFLICTS_DIR}"
+        buttons[f"{icons.check} {label}"] = lambda: async_thread.run(_reorganize_apply(base, moves + conflicts))
+    buttons[f"{icons.cancel} Annuler"] = None
     _reorg_msg(
         text + "\n\nLes chemins des exes seront mis a jour. Un journal permet d'annuler.\n"
         "Ferme les jeux en cours avant de continuer.",
         MsgBox.info,
-        {
-            f"{icons.check} Ranger": lambda: async_thread.run(_reorganize_apply(base, moves)),
-            f"{icons.cancel} Annuler": None,
-        },
+        buttons,
         more="\n".join(details),
     )
 
@@ -3304,7 +3359,10 @@ async def _reorganize_apply(base: Path, moves: list[dict]) -> None:
             await _rebase_executables(base, done)
     finally:
         _reorg_busy = False
-    text = f"{len(done)} dossier(s) range(s)."
+    moved_conflicts = sum(1 for m in done if m.get("game_ids"))
+    text = f"{len(done) - moved_conflicts} dossier(s) range(s)."
+    if moved_conflicts:
+        text += f"\n{moved_conflicts} dossier(s) en conflit deplace(s) dans {CONFLICTS_DIR}."
     if errors:
         text += f"\n{len(errors)} echec(s) (jeu ouvert, fichier verrouille...) : voir le detail."
     _reorg_msg(text, MsgBox.warn if errors else MsgBox.info, more="\n".join(errors) or None)
