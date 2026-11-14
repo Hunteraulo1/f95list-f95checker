@@ -3060,6 +3060,7 @@ def _rel_exe_parts(exe: str, base: Path) -> tuple[str, ...] | None:
 
 
 CONFLICTS_DIR = "___CONFLICTS___"
+IGNORED_DIR = "___IGNORED___"
 
 
 def _self_root() -> Path:
@@ -3129,8 +3130,8 @@ def _plan_reorganize(base: Path, games: list) -> dict:
         })
 
     for top, info in sorted(by_top.items(), key=lambda kv: kv[0].lower()):
-        if top.lower() == CONFLICTS_DIR.lower():
-            continue  # Dossier des conflits : jamais range
+        if top.lower() in (CONFLICTS_DIR.lower(), IGNORED_DIR.lower()):
+            continue  # Dossiers des conflits / ignores : jamais ranges
         if _contains(base / top, self_root):
             skipped.append((top, "contient F95Checker, jamais deplace"))
             continue
@@ -3175,11 +3176,20 @@ def _plan_reorganize(base: Path, games: list) -> dict:
         containers[clean.lower()] = game.id
         moves.append({"game_id": game.id, "game": game.name, "old": top, "new": f"{clean}/{top}"})
 
-    planned = set(containers) | {CONFLICTS_DIR.lower()}
+    planned = set(containers) | {CONFLICTS_DIR.lower(), IGNORED_DIR.lower()}
+    orphans: list[dict] = []  # Dossiers sans jeu : deplacables dans ___IGNORED___
     for d in sorted(base.iterdir(), key=lambda p: p.name.lower()) if base.is_dir() else []:
         if d.is_dir() and not d.name.startswith(".") and d.name.lower() not in tops_lower and d.name.lower() not in planned:
-            skipped.append((d.name, "aucun jeu de F95Checker ne pointe dessus"))
-    return {"moves": moves, "conflicts": conflicts, "skipped": skipped, "already": already}
+            if _contains(d, self_root):
+                skipped.append((d.name, "contient F95Checker, jamais deplace"))
+            elif (base / IGNORED_DIR / d.name).exists():
+                skipped.append((d.name, f"aucun jeu de F95Checker ne pointe dessus ; deja present dans {IGNORED_DIR}"))
+            else:
+                skipped.append((d.name, "aucun jeu de F95Checker ne pointe dessus"))
+                orphans.append({"kind": "ignored", "game_ids": [], "old": d.name, "new": f"{IGNORED_DIR}/{d.name}"})
+    for c in conflicts:
+        c["kind"] = "conflict"
+    return {"moves": moves, "conflicts": conflicts, "orphans": orphans, "skipped": skipped, "already": already}
 
 
 def _move_dir(base: Path, old: str, new: str) -> None:
@@ -3256,7 +3266,7 @@ def _execute_moves(base: Path, moves: list[dict], reverse: bool = False) -> tupl
 
 async def _rebase_executables(base: Path, moves: list[dict], reverse: bool = False) -> None:
     from modules import db, globals, utils
-    for m, game_id in ((m, gid) for m in moves for gid in (m.get("game_ids") or [m["game_id"]])):
+    for m, game_id in ((m, gid) for m in moves for gid in (m["game_ids"] if "game_ids" in m else [m["game_id"]])):
         game = globals.games.get(game_id)
         if game is None:
             continue
@@ -3305,8 +3315,8 @@ async def reorganize_preview() -> None:
         return
     finally:
         _reorg_busy = False
-    moves, conflicts, skipped = plan["moves"], plan["conflicts"], plan["skipped"]
-    conflict_dirs = {c["old"] for c in conflicts}
+    moves, conflicts, orphans, skipped = plan["moves"], plan["conflicts"], plan["orphans"], plan["skipped"]
+    special = {c["old"] for c in conflicts} | {o["old"] for o in orphans}
     details = []
     if moves:
         details.append(f"A RANGER ({len(moves)})")
@@ -3314,33 +3324,79 @@ async def reorganize_preview() -> None:
     if conflicts:
         details.append(f"\nCONFLITS ({len(conflicts)}) : deplacables dans {CONFLICTS_DIR} (option)")
         details += [f"  {c['old']}  :  {c['reason']}" for c in conflicts]
-    others = [(label, reason) for label, reason in skipped if label not in conflict_dirs]
+    if orphans:
+        details.append(f"\nSANS JEU ({len(orphans)}) : deplacables dans {IGNORED_DIR} (option)")
+        details += [f"  {o['old']}" for o in orphans]
+    others = [(label, reason) for label, reason in skipped if label not in special]
     if others:
-        details.append(f"\nIGNORES ({len(others)})")
+        details.append(f"\nAUTRES IGNORES ({len(others)})")
         details += [f"  {label}  :  {reason}" for label, reason in others]
     text = (
         f"Dossier des jeux : {base}\n\n"
         f"{len(moves)} dossier(s) a ranger dans <Nom du jeu>/<dossier actuel>.\n"
         f"{plan['already']} deja range(s), {len(skipped)} dossier(s) ignore(s)"
         + (f", dont {len(conflicts)} en conflit" if conflicts else "")
-        + " (voir le detail)."
+        + (f" et {len(orphans)} sans jeu" if orphans else "")
+        + "."
     )
-    if not moves and not conflicts:
+    if not moves and not conflicts and not orphans:
         _reorg_msg(text + "\n\nRien a ranger.", MsgBox.info, more="\n".join(details) or None)
         return
-    buttons = {}
-    if moves:
-        buttons[f"{icons.check} Ranger"] = lambda: async_thread.run(_reorganize_apply(base, moves))
-    if conflicts:
-        label = f"Ranger + conflits dans {CONFLICTS_DIR}" if moves else f"Deplacer les conflits dans {CONFLICTS_DIR}"
-        buttons[f"{icons.check} {label}"] = lambda: async_thread.run(_reorganize_apply(base, moves + conflicts))
-    buttons[f"{icons.cancel} Annuler"] = None
-    _reorg_msg(
-        text + "\n\nLes chemins des exes seront mis a jour. Un journal permet d'annuler.\n"
-        "Ferme les jeux en cours avant de continuer.",
-        MsgBox.info,
-        buttons,
-        more="\n".join(details),
+    _reorg_preview_popup(base, text, "\n".join(details), moves, conflicts, orphans)
+
+
+def _reorg_preview_popup(base: Path, text: str, details: str, moves: list, conflicts: list, orphans: list) -> None:
+    import imgui
+    from external import async_thread
+    from modules import globals, icons, utils
+
+    opts = {"conflicts": False, "orphans": False}
+
+    def content():
+        imgui.text(text)
+        imgui.spacing()
+        if conflicts:
+            _, opts["conflicts"] = imgui.checkbox(
+                f"Deplacer aussi les {len(conflicts)} dossier(s) en conflit dans {CONFLICTS_DIR}###reorg_conflicts",
+                opts["conflicts"],
+            )
+        if orphans:
+            _, opts["orphans"] = imgui.checkbox(
+                f"Deplacer aussi les {len(orphans)} dossier(s) sans jeu dans {IGNORED_DIR}###reorg_orphans",
+                opts["orphans"],
+            )
+        imgui.spacing()
+        imgui.text("Les chemins des exes seront mis a jour. Un journal permet d'annuler.\n"
+                   "Ferme les jeux en cours avant de continuer.")
+        imgui.spacing()
+        size = imgui.io.display_size
+        try:
+            imgui.push_font(imgui.fonts.mono_sm)
+            pushed = True
+        except Exception:
+            pushed = False
+        imgui.input_text_multiline(
+            "###reorg_details", details,
+            width=min(globals.gui.scaled(900), size.x * 0.8),
+            height=min(globals.gui.scaled(350), size.y * 0.45),
+            flags=imgui.INPUT_TEXT_READ_ONLY,
+        )
+        if pushed:
+            imgui.pop_font()
+
+    def apply():
+        selected = list(moves)
+        if opts["conflicts"]:
+            selected += conflicts
+        if opts["orphans"]:
+            selected += orphans
+        if selected:
+            async_thread.run(_reorganize_apply(base, selected))
+
+    utils.push_popup(
+        utils.popup, "Rangement des jeux", content,
+        buttons={f"{icons.check} Ranger": apply, f"{icons.cancel} Annuler": None},
+        closable=True, outside=False,
     )
 
 
@@ -3359,10 +3415,13 @@ async def _reorganize_apply(base: Path, moves: list[dict]) -> None:
             await _rebase_executables(base, done)
     finally:
         _reorg_busy = False
-    moved_conflicts = sum(1 for m in done if m.get("game_ids"))
-    text = f"{len(done) - moved_conflicts} dossier(s) range(s)."
+    moved_conflicts = sum(1 for m in done if m.get("kind") == "conflict")
+    moved_orphans = sum(1 for m in done if m.get("kind") == "ignored")
+    text = f"{len(done) - moved_conflicts - moved_orphans} dossier(s) range(s)."
     if moved_conflicts:
         text += f"\n{moved_conflicts} dossier(s) en conflit deplace(s) dans {CONFLICTS_DIR}."
+    if moved_orphans:
+        text += f"\n{moved_orphans} dossier(s) sans jeu deplace(s) dans {IGNORED_DIR}."
     if errors:
         text += f"\n{len(errors)} echec(s) (jeu ouvert, fichier verrouille...) : voir le detail."
     _reorg_msg(text, MsgBox.warn if errors else MsgBox.info, more="\n".join(errors) or None)
