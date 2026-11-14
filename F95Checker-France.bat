@@ -271,12 +271,30 @@ GUI_TR_CLEANUP_NEW = GUI_TR_CLEANUP_OLD + """
                 ("tr_delete_extracted", "Traductions : supprimer le dossier decompresse",
                  "Supprime le dossier decompresse une fois la traduction installee\\n"
                  "(les fichiers sont deja copies dans le jeu)."),
-            ):
+            ):"""
+
+GUI_TR_CLEANUP_LOOP_BODY = """
                 draw_settings_label(tr_label, tr_tip)
                 imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + checkbox_offset)
                 tr_changed, tr_value = imgui.checkbox(f"###{tr_key}", france_labels.tr_cleanup_setting(tr_key))
                 if tr_changed:
                     france_labels.set_tr_cleanup_setting(tr_key, tr_value)"""
+
+# Version precedente (2 reglages) : remplacee a la volee pour les sources deja patchees
+GUI_TR_CLEANUP_V1 = GUI_TR_CLEANUP_NEW + GUI_TR_CLEANUP_LOOP_BODY
+GUI_TR_CLEANUP_NEW = GUI_TR_CLEANUP_NEW[:-len("\n            ):")] + """
+                ("game_delete_archive", "Jeux (Donor DDL) : supprimer l'archive",
+                 "Supprime l'archive du jeu telechargee via Donor DDL une fois\\n"
+                 "son extraction reussie (option \\"Extract downloads\\" activee)."),
+            ):""" + GUI_TR_CLEANUP_LOOP_BODY
+
+GUI_DDL_OPEN_OLD = """                    if not errored:
+                        if imgui.button(icons.open_in_app):
+                            async_thread.run(callbacks.default_open(download.path))"""
+
+GUI_DDL_OPEN_NEW = """                    if not errored:
+                        if download.path.exists() and imgui.button(icons.open_in_app):  # archive peut-etre supprimee
+                            async_thread.run(callbacks.default_open(download.path))"""
 
 GUI_ANCHOR = """            imgui.end_table()
             imgui.spacing()
@@ -1207,6 +1225,18 @@ DDL_EXTRACT_NEW = """            download.extracted = await asyncio.get_event_lo
             except Exception:
                 pass  # Never fail a successful download because of exe detection"""
 
+DDL_DELETE_ARCHIVE_OLD = """                await auto_add_executables(download)
+            except Exception:
+                pass  # Never fail a successful download because of exe detection"""
+
+DDL_DELETE_ARCHIVE_NEW = DDL_DELETE_ARCHIVE_OLD + """
+            try:
+                from modules import france_labels
+                if france_labels.tr_cleanup_setting("game_delete_archive"):
+                    download.path.unlink(missing_ok=True)  # Extraction reussie : l'archive n'est plus utile
+            except Exception:
+                pass"""
+
 DDL_DOWNLOAD_ANCHOR = "async def download_file(download: FileDownload):"
 
 DDL_HELPERS = r'''_extract_junk_names = {"__macosx", ".ds_store", "thumbs.db", "desktop.ini"}
@@ -1421,6 +1451,7 @@ def apply_ddl_patches() -> None:
     structs_text = structs_module.read_text(encoding="utf-8")
     api_text = api_module.read_text(encoding="utf-8")
     if "def smart_extract(" in api_text and "game_id: int = None" in structs_text:
+        _apply_ddl_delete_archive_patch(api_module, api_text)
         return
     if (
         structs_text.count(DDL_STRUCTS_OLD) != 1
@@ -1440,6 +1471,19 @@ def apply_ddl_patches() -> None:
     py_compile.compile(str(structs_module), doraise=True)
     py_compile.compile(str(api_module), doraise=True)
     print("Extraction Donor DDL intelligente + ajout auto de l'exe (api.py, structs.py).")
+    _apply_ddl_delete_archive_patch(api_module, api_text)
+
+
+def _apply_ddl_delete_archive_patch(api_module: Path, api_text: str) -> None:
+    if "game_delete_archive" in api_text:
+        return
+    if api_text.count(DDL_DELETE_ARCHIVE_OLD) != 1:
+        print("ATTENTION : api.py a change, suppression de l'archive Donor DDL impossible.")
+        return
+    api_module.write_text(api_text.replace(DDL_DELETE_ARCHIVE_OLD, DDL_DELETE_ARCHIVE_NEW, 1), encoding="utf-8")
+    import py_compile
+    py_compile.compile(str(api_module), doraise=True)
+    print("Suppression optionnelle de l'archive apres extraction Donor DDL (api.py).")
 
 
 GUI_TR_TAB_OLD = """                if imgui.begin_tab_item((
@@ -1502,11 +1546,19 @@ def apply_patches() -> None:
             raise SystemExit("gui.py a change : patch bouton mises a jour impossible.")
         text = text.replace(GUI_UPDATE_CHECK_OLD, GUI_UPDATE_CHECK_NEW, 1)
         print("Bouton de verification des mises a jour ajoute (gui.py).")
-    if "tr_cleanup_setting" not in text:
-        if GUI_TR_CLEANUP_OLD not in text:
-            raise SystemExit("gui.py a change : patch reglages des traductions impossible.")
-        text = text.replace(GUI_TR_CLEANUP_OLD, GUI_TR_CLEANUP_NEW, 1)
-        print("Reglages de nettoyage des traductions ajoutes (gui.py).")
+    if "game_delete_archive" not in text:
+        if GUI_TR_CLEANUP_V1 in text:
+            text = text.replace(GUI_TR_CLEANUP_V1, GUI_TR_CLEANUP_NEW, 1)
+        elif "tr_cleanup_setting" not in text and GUI_TR_CLEANUP_OLD in text:
+            text = text.replace(GUI_TR_CLEANUP_OLD, GUI_TR_CLEANUP_NEW, 1)
+        else:
+            raise SystemExit("gui.py a change : patch reglages de nettoyage impossible.")
+        print("Reglages de nettoyage des archives ajoutes (gui.py).")
+    if "archive peut-etre supprimee" not in text:
+        if GUI_DDL_OPEN_OLD in text:
+            text = text.replace(GUI_DDL_OPEN_OLD, GUI_DDL_OPEN_NEW, 1)
+        else:
+            print("ATTENTION : gui.py a change, bouton d'ouverture de l'archive Donor DDL non adapte.")
     if "france_labels," not in text:
         if GUI_IMPORT_OLD not in text:
             raise SystemExit("Import france_labels impossible dans gui.py.")
@@ -1770,7 +1822,7 @@ def load_config() -> configparser.ConfigParser:
     return cfg
 
 
-_TR_CLEANUP_KEYS = ("tr_delete_archive", "tr_delete_extracted")
+_TR_CLEANUP_KEYS = ("tr_delete_archive", "tr_delete_extracted", "game_delete_archive")
 _tr_cleanup_cache: dict[str, bool] | None = None
 
 
