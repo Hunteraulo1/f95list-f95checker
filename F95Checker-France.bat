@@ -2447,17 +2447,32 @@ def _push_msg(text: str, level=None, buttons=True) -> None:
     utils.push_popup(msgbox.msgbox, "Traduction F95-France", text, level or MsgBox.info, buttons)
 
 
-def _offer_install(game, translation: dict, extracted: Path) -> None:
+def _offer_install(game, translation: dict, extracted: Path, mods_ok: bool = False) -> None:
     from common.structs import MsgBox
     from external import async_thread
     from modules import callbacks, icons
 
     open_folder = (f"{icons.folder_open_outline} Ouvrir le dossier", lambda: async_thread.run(callbacks.default_open(str(extracted))))
+    if translation.get("tname") == "translation_with_mods" and not mods_ok:
+        buttons = {f"{icons.check} Continuer": lambda: _offer_install(game, translation, extracted, mods_ok=True)}
+        if link := translation.get("tlink"):
+            buttons[f"{icons.open_in_new} Voir la page"] = lambda: callbacks.open_webpage(link)
+        buttons[open_folder[0]] = open_folder[1]
+        buttons[f"{icons.cancel} Annuler"] = None
+        _push_msg(
+            "Cette traduction est prevue pour une version du jeu avec des mods.\n\n"
+            "Il peut etre necessaire d'installer un ou plusieurs mods pour qu'elle\n"
+            "fonctionne correctement (textes manquants ou erreurs sinon).\n"
+            "Verifie la page de la traduction ou le fichier A_Lire / readme fourni.",
+            MsgBox.warn,
+            buttons,
+        )
+        return
     game_root = _game_root(game)
     if game_root is None:
         def _after_exe(selected):
             if selected:
-                _offer_install(game, translation, extracted)
+                _offer_install(game, translation, extracted, mods_ok=True)
         _push_msg(
             f"Traduction telechargee dans :\n{extracted}\n\n"
             "Aucun executable n'est defini pour ce jeu, impossible de savoir ou l'installer.\n"
